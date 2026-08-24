@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from god!")
+from god.train import main
