@@ -1,8 +1,14 @@
 _default:
 	@just --list
 
-run *args="--help":
-	uv run god {{args}}
+mlp *args="":
+	uv run god-mlp {{args}}
+
+mlp-grokk *args="":
+	uv run god-mlp-grokk {{args}}
+
+pcn *args="":
+	uv run god-pcn {{args}}
 
 typecheck path='src':
 	uv run basedpyright {{path}}

@@ -40,7 +40,7 @@ from tqdm import trange
 from god.data import ESCAPE_RADIUS, make_dataset
 from god.encoding import K_DEFAULT, enc_dim
 
-DATA_DIR = Path("data/pcn")
+DATA_DIR = Path("data/mandel/pcn")
 
 _LR_FLOOR = 1e-9
 

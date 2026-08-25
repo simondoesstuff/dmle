@@ -26,7 +26,9 @@ dependencies = [
 ]
 
 [project.scripts]
-god = "god:main"
+god-mlp = "god.train_mlp:main"
+god-mlp-grokk = "god.train_mlp:main_grokk"
+god-pcn = "god.train_pcn:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

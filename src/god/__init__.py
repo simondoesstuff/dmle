@@ -1,1 +1,1 @@
-from god.train import main
+from god.train_mlp import main

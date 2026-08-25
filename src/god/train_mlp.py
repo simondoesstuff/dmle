@@ -1,9 +1,8 @@
-"""Training script for MandelbrotRNN with grokking study support.
+"""MLP training for Mandelbrot magnitude prediction.
 
-Optimisation: AdamW + gradient clipping + single-cycle cosine LR with warmup.
-Checkpointing is LR-proportional: dense while LR is high (model changing fast),
-sparse near the tail (LR → 0, model frozen).  Each checkpoint saves model
-weights and a prediction visualisation.
+Two preset configurations:
+  TrainConfig() — default: small-data, high-reg, long training (primary grokking study)
+  simple_config() — large-data, cosine LR, standard regularisation (baseline)
 """
 
 import dataclasses
@@ -24,13 +23,14 @@ from god.data import ESCAPE_RADIUS, make_dataset
 from god.encoding import K_DEFAULT, enc_dim
 from god.model import MandelbrotRNN
 
-DATA_DIR = Path("data/mandel")
-
-_LR_FLOOR = 1e-9  # guard division by zero in interval formula
+_LR_FLOOR = 1e-9
 
 
 @dataclass
 class TrainConfig:
+    # Paths
+    data_dir: str = "data/mandel/mlp_grokk"
+
     # Model
     K: int = K_DEFAULT
     hidden_dim: int = 128
@@ -39,24 +39,40 @@ class TrainConfig:
     linear_head: bool = False
 
     # Data
-    n_train: int = 10_000
+    n_train: int = 500
     n_test: int = 2_000
 
     # Training
-    batch_size: int = 256
-    n_epochs: int = 3000
-    lr_peak: float = 1e-3
-    warmup_frac: float = 0.05
-    weight_decay: float = 0.01
+    batch_size: int = 64
+    n_epochs: int = 12_000
+    lr_peak: float = 1e-4
+    warmup_frac: float = 0.0   # 0 → constant LR; >0 → warmup then cosine decay
+    lr_end: float = 1e-4       # equal to lr_peak → constant; 0.0 → cosine-to-zero
+    weight_decay: float = 0.5
     grad_clip: float = 1.0
 
     # Checkpointing: interval ∝ lr_peak / current_lr
-    #   dense early (high LR, model moving) → sparse late (LR → 0, model frozen)
-    checkpoint_min_interval: int = 10   # epochs between checkpoints at peak LR
-    checkpoint_max_interval: int = 300  # cap on interval at the frozen tail
+    checkpoint_min_interval: int = 50
+    checkpoint_max_interval: int = 50
 
     # Reproducibility
     seed: int = 0
+
+
+def simple_config() -> TrainConfig:
+    """Baseline MLP: large dataset, cosine LR with warmup, standard regularisation."""
+    return TrainConfig(
+        data_dir="data/mandel/mlp",
+        n_train=10_000,
+        batch_size=256,
+        n_epochs=3_000,
+        lr_peak=1e-3,
+        warmup_frac=0.05,
+        lr_end=0.0,
+        weight_decay=0.01,
+        checkpoint_min_interval=10,
+        checkpoint_max_interval=300,
+    )
 
 
 def _checkpoint_interval(current_lr: float, cfg: TrainConfig) -> int:
@@ -81,7 +97,6 @@ def _visualize_model(
     out_path: Path,
     epoch: int | None = None,
 ) -> None:
-    """Render true vs predicted magnitude and save to out_path (no plt.show)."""
     import matplotlib.pyplot as plt
 
     from god.data import mandelbrot_mag
@@ -133,7 +148,6 @@ def plot_metrics(
     baseline: float,
     out_path: Path,
 ) -> None:
-    """Log–log train/test MSE with LR overlay; vertical marks at checkpoints."""
     import matplotlib.pyplot as plt
 
     epochs = [m["epoch"] for m in metrics]
@@ -163,7 +177,7 @@ def plot_metrics(
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=8)
-    ax1.set_title("Mandelbrot RNN — grokking study (log–log)")
+    ax1.set_title("Mandelbrot RNN — training (log–log)")
     ax1.grid(True, alpha=0.3, which="both")
 
     plt.tight_layout()
@@ -173,7 +187,6 @@ def plot_metrics(
 
 
 def load_checkpoint(path: str | Path, cfg: TrainConfig) -> MandelbrotRNN:
-    """Load a saved checkpoint. Requires a matching TrainConfig to reconstruct the template."""
     d = enc_dim(cfg.K)
     template = MandelbrotRNN(
         d, cfg.hidden_dim, cfg.depth, cfg.num_steps,
@@ -192,8 +205,9 @@ def train(cfg: TrainConfig) -> MandelbrotRNN:
         linear_head=cfg.linear_head,
     )
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    (DATA_DIR / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2))
+    data_dir = Path(cfg.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2))
 
     print("Generating datasets...")
     c_train, t_train = make_dataset(cfg.n_train, cfg.num_steps, k_train, train=True, K=cfg.K)
@@ -201,17 +215,21 @@ def train(cfg: TrainConfig) -> MandelbrotRNN:
     const_baseline = float(jnp.mean((t_train - jnp.mean(t_train)) ** 2))
     print(f"Constant-mean MSE baseline: {const_baseline:.4f}")
 
-    steps_per_epoch = cfg.n_train // cfg.batch_size
+    steps_per_epoch = max(1, cfg.n_train // cfg.batch_size)
     total_steps = steps_per_epoch * cfg.n_epochs
-    warmup_steps = max(1, int(cfg.warmup_frac * total_steps))
+    warmup_steps = int(cfg.warmup_frac * total_steps)
 
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=cfg.lr_peak,
-        warmup_steps=warmup_steps,
-        decay_steps=total_steps,
-        end_value=0.0,
-    )
+    if warmup_steps > 0:
+        schedule: optax.Schedule = optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=cfg.lr_peak,
+            warmup_steps=warmup_steps,
+            decay_steps=total_steps,
+            end_value=cfg.lr_end,
+        )
+    else:
+        schedule = optax.constant_schedule(cfg.lr_peak)
+
     optimizer = optax.chain(
         optax.clip_by_global_norm(cfg.grad_clip),
         optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay),
@@ -252,7 +270,7 @@ def train(cfg: TrainConfig) -> MandelbrotRNN:
     print(f"Training: {cfg.n_train} samples, {steps_per_epoch} steps/epoch, {cfg.n_epochs} epochs")
 
     metrics: list[dict[str, Any]] = []
-    ckpt_dir = DATA_DIR / "checkpoints"
+    ckpt_dir = data_dir / "checkpoints"
     last_checkpoint_epoch = 0
 
     pbar = trange(cfg.n_epochs, desc="epochs")
@@ -294,8 +312,8 @@ def train(cfg: TrainConfig) -> MandelbrotRNN:
         metrics.append(record)
 
         if record.get("checkpoint"):
-            (DATA_DIR / "metrics.json").write_text(json.dumps(metrics, indent=2))
-            plot_metrics(metrics, const_baseline, DATA_DIR / "train_curve.png")
+            (data_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+            plot_metrics(metrics, const_baseline, data_dir / "train_curve.png")
 
         pbar.set_postfix(
             train=f"{train_loss:.4f}",
@@ -304,22 +322,30 @@ def train(cfg: TrainConfig) -> MandelbrotRNN:
             s=f"{elapsed:.1f}s",
         )
 
-    (DATA_DIR / "metrics.json").write_text(json.dumps(metrics, indent=2))
-    plot_metrics(metrics, const_baseline, DATA_DIR / "train_curve.png")
-    print(f"Metrics → {DATA_DIR / 'metrics.json'}")
-    print(f"Train curve → {DATA_DIR / 'train_curve.png'}")
+    (data_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    plot_metrics(metrics, const_baseline, data_dir / "train_curve.png")
+    print(f"Metrics → {data_dir / 'metrics.json'}")
+    print(f"Train curve → {data_dir / 'train_curve.png'}")
 
     return model
 
 
 def visualize(model: MandelbrotRNN, cfg: TrainConfig) -> None:
-    """Save final prediction visualisation."""
-    out = DATA_DIR / "mandelbrot_prediction.png"
+    data_dir = Path(cfg.data_dir)
+    out = data_dir / "mandelbrot_prediction.png"
     _visualize_model(model, cfg, out)
     print(f"Saved {out}")
 
 
 def main() -> None:
+    """Entry point for god-mlp: baseline large-data experiment."""
+    cfg = simple_config()
+    model = train(cfg)
+    visualize(model, cfg)
+
+
+def main_grokk() -> None:
+    """Entry point for god-mlp-grokk: primary small-data grokking experiment."""
     cfg = TrainConfig()
     model = train(cfg)
     visualize(model, cfg)
