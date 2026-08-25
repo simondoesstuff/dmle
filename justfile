@@ -10,6 +10,9 @@ mlp-grokk *args="":
 pcn *args="":
 	uv run god-pcn {{args}}
 
+hnn *args="":
+	uv run god-hnn {{args}}
+
 typecheck path='src':
 	uv run basedpyright {{path}}
 
