@@ -1,18 +1,16 @@
 """Hypernetwork (HNN) for Mandelbrot magnitude prediction.
 
 Architecture:
-    x (noise ∈ [-1, 1]^n_stimulus) → GaussianEncoder → stimulus
-    stimulus → stimulus_to_coord_params (FFN) → coord net weights
+    x (noise ∈ [-1, 1]^n_stimulus) ──────────────────────────────────────────
+    stimulus_to_coord_params (FFN) → coord net weights
     param_embeddings (frozen) ──(coord net)──→ flat target net params
     target net params → target RNN → scalar magnitude prediction
 
-GaussianEncoder uses the reparameterisation trick with learnable μ, log σ²:
-    stimulus = x · σ · temperature + μ
-Regularised by KL(N(μ, diag(σ²)) ‖ N(0, I)), bounding entropy above and below.
-
-Oscillatory training:
-  - Gaussian phase: update GaussianEncoder (μ, log σ²) with KL regularisation
-  - Rest phase: update stimulus_to_coord_params
+The stimulus is the raw noise vector x ~ U[-1,1]^n_stimulus, passed directly
+into the stimulus FFN with no learned encoder.  Different x values generate
+different target networks; tracking the functional diversity of those networks
+over training reveals whether the FFN is exploiting stimulus variation or
+collapsing to a single solution.
 """
 
 import math
@@ -31,39 +29,6 @@ class CoordWeights(NamedTuple):
     b1: Float[Array, "coord_hidden"]
     W2: Float[Array, "1 coord_hidden"]
     b2: Float[Array, "1"]
-
-
-class GaussianEncoder(eqx.Module):
-    """Reparameterised Gaussian encoder: stimulus = x · σ · temperature + μ.
-
-    x ∈ [-1, 1]^n_stimulus is provided externally each forward pass.
-    Learnable μ and log σ² (= log_var) parameterise the distribution;
-    exp(log_var) = σ² is always positive by construction.
-    """
-
-    mu: Float[Array, "n_stimulus"]
-    log_var: Float[Array, "n_stimulus"]  # log(σ²); σ = exp(0.5 · log_var)
-
-    def __init__(self, n_stimulus: int) -> None:
-        # Initialise at the prior N(0, I) — KL = 0 at start
-        self.mu = jnp.zeros(n_stimulus)
-        self.log_var = jnp.zeros(n_stimulus)
-
-    def __call__(
-        self,
-        x: Float[Array, "n_stimulus"],
-        temperature: float,
-    ) -> Float[Array, "n_stimulus"]:
-        sigma = jnp.exp(0.5 * self.log_var)
-        return x * sigma * temperature + self.mu
-
-    def kl_loss(self) -> Float[Array, ""]:
-        """KL(N(μ, diag(σ²)) ‖ N(0, I)) = 0.5 · Σ(μ² + σ² − 1 − log σ²).
-
-        Always ≥ 0; zero iff μ = 0 and σ = 1 everywhere.
-        Prevents both bandwidth collapse (σ→0) and explosion (σ→∞).
-        """
-        return 0.5 * jnp.sum(self.mu ** 2 + jnp.exp(self.log_var) - 1.0 - self.log_var)
 
 
 def _build_param_embeddings(
@@ -193,7 +158,6 @@ def _stimulus_to_coord_weights(
 
 class HyperNetwork(eqx.Module):
     # Learnable parameters (pytree leaves)
-    gaussian_encoder: GaussianEncoder
     stimulus_to_coord_params: eqx.nn.MLP
     param_embeddings: Float[Array, "n_params embed_dim"]  # frozen via stop_gradient
 
@@ -205,17 +169,15 @@ class HyperNetwork(eqx.Module):
     target_is_rnn: bool = eqx.field(static=True)
     n_cell_layers: int = eqx.field(static=True)    # RNN cell depth; 0 if FFN
     rnn_num_steps: int = eqx.field(static=True)    # RNN recurrence steps; 0 if FFN
-    temperature: float = eqx.field(static=True)
 
     def target_params(
         self,
         x_noise: Float[Array, "n_stimulus"],
     ) -> Float[Array, "n_params"]:
-        """Generate the flat target network parameter vector."""
-        stimulus = self.gaussian_encoder(x_noise, self.temperature)
+        """Generate the flat target network parameter vector from stimulus x_noise."""
         cw = _stimulus_to_coord_weights(
             self.stimulus_to_coord_params,
-            stimulus,
+            x_noise,
             self.coord_net_embed_dim,
             self.coord_net_hidden,
         )
@@ -227,10 +189,9 @@ class HyperNetwork(eqx.Module):
         c_enc: Float[Array, "enc_dim"],
         x_noise: Float[Array, "n_stimulus"],
     ) -> Float[Array, ""]:
-        stimulus = self.gaussian_encoder(x_noise, self.temperature)
         cw = _stimulus_to_coord_weights(
             self.stimulus_to_coord_params,
-            stimulus,
+            x_noise,
             self.coord_net_embed_dim,
             self.coord_net_hidden,
         )
@@ -259,7 +220,6 @@ def make_hypernetwork(
     rnn_depth: int = 2,
     rnn_num_steps: int = 10,
     # Shared
-    temperature: float = 1.0,
     init_scale: float = 0.1,
     stim_ffn_hidden: int = 128,
     stim_ffn_depth: int = 2,
@@ -267,7 +227,6 @@ def make_hypernetwork(
     d = enc_dim(K)
 
     if target_is_rnn:
-        # Cell: [2*d] + [rnn_hidden_dim]*(rnn_depth-1) + [d]; headless (returns h_T[0])
         cell_dims = [2 * d] + [rnn_hidden_dim] * (rnn_depth - 1) + [d]
         param_layout: list[tuple[str, tuple[int, ...]]] = []
         for l, (in_sz, out_sz) in enumerate(zip(cell_dims, cell_dims[1:])):
@@ -302,7 +261,6 @@ def make_hypernetwork(
         activation=jax.nn.tanh,
         key=k1,
     )
-    # Scale output layer to keep coord net weights small at init
     stim_ffn = eqx.tree_at(
         lambda m: (m.layers[-1].weight, m.layers[-1].bias),
         stim_ffn,
@@ -310,7 +268,6 @@ def make_hypernetwork(
     )
 
     return HyperNetwork(
-        gaussian_encoder=GaussianEncoder(n_stimulus),
         stimulus_to_coord_params=stim_ffn,
         param_embeddings=_build_param_embeddings(
             param_layout=param_layout,
@@ -325,11 +282,42 @@ def make_hypernetwork(
         target_is_rnn=target_is_rnn,
         n_cell_layers=n_cell_layers_val,
         rnn_num_steps=rnn_num_steps_val,
-        temperature=temperature,
     )
 
 
 def n_trainable_params(model: HyperNetwork) -> int:
     """Count trainable parameters (excludes frozen param_embeddings)."""
-    rest = (model.gaussian_encoder, model.stimulus_to_coord_params)
-    return sum(x.size for x in jax.tree_util.tree_leaves(eqx.filter(rest, eqx.is_array)))
+    return sum(
+        x.size
+        for x in jax.tree_util.tree_leaves(
+            eqx.filter(model.stimulus_to_coord_params, eqx.is_array)
+        )
+    )
+
+
+def target_network_diversity(
+    model: HyperNetwork,
+    c_encs: Float[Array, "n_points enc_dim"],
+    x_samples: Float[Array, "n_mc n_stimulus"],
+) -> dict[str, float]:
+    """Measure functional diversity of sampled target networks.
+
+    Returns:
+        param_std:  mean per-parameter std across x samples — 0 means all
+                    generated networks have identical weights.
+        pred_std:   mean per-c_enc std of scalar outputs across x samples — 0
+                    means all networks produce identical predictions.
+        pred_range: mean range (max-min) of predictions across x samples.
+    """
+    # Parameter diversity: (n_mc, n_params)
+    all_params = jax.vmap(model.target_params)(x_samples)
+    param_std = float(jnp.mean(jnp.std(all_params, axis=0)))
+
+    # Functional diversity: (n_mc, n_points)
+    per_x_preds = jax.vmap(
+        lambda x: jax.vmap(model, in_axes=(0, None))(c_encs, x)
+    )(x_samples)
+    pred_std = float(jnp.mean(jnp.std(per_x_preds, axis=0)))
+    pred_range = float(jnp.mean(jnp.max(per_x_preds, axis=0) - jnp.min(per_x_preds, axis=0)))
+
+    return {"param_std": param_std, "pred_std": pred_std, "pred_range": pred_range}
