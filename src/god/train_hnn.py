@@ -8,6 +8,8 @@ Loss per step:
     MSE averaged over n_mc_train networks + lambda_target_decay * mean(||params||²)
 
 Diversity metrics are logged at every checkpoint to detect stimulus collapse.
+Resumption: `train()` auto-detects the latest checkpoint in data_dir/checkpoints/
+and continues from there if one exists.
 See docs/hnn.md for full architecture description.
 """
 
@@ -50,7 +52,7 @@ class HNNConfig:
     num_steps: int = 10
 
     # Training
-    n_steps: int = 40_000
+    n_steps: int = 150_000
     batch_size: int = 64
     lr: float = 3e-4
     weight_decay: float = 0.01
@@ -82,6 +84,92 @@ class HNNConfig:
     seed: int = 0
 
 
+# ── checkpoint helpers ────────────────────────────────────────────────────────
+
+def _ckpt_tag(step: int) -> str:
+    return f"step_{step:05d}"
+
+
+def _make_model_template(cfg: HNNConfig, key: jax.Array | None = None) -> HyperNetwork:
+    if key is None:
+        key = jax.random.split(jax.random.PRNGKey(cfg.seed), 5)[0]
+    return make_hypernetwork(
+        key,
+        K=cfg.K,
+        n_stimulus=cfg.n_stimulus,
+        node_vec_dim=cfg.node_vec_dim,
+        coord_net_hidden=cfg.coord_net_hidden,
+        target_hidden_dim=cfg.target_hidden_dim,
+        n_target_hidden_layers=cfg.n_target_hidden_layers,
+        target_is_rnn=cfg.target_is_rnn,
+        rnn_hidden_dim=cfg.rnn_hidden_dim,
+        rnn_depth=cfg.rnn_depth,
+        rnn_num_steps=cfg.rnn_num_steps,
+        init_scale=cfg.init_scale,
+        stim_ffn_hidden=cfg.stim_ffn_hidden,
+        stim_ffn_depth=cfg.stim_ffn_depth,
+    )
+
+
+def _find_latest_checkpoint(ckpt_dir: Path) -> int | None:
+    """Return the step number of the most recent checkpoint, or None."""
+    # Prefer checkpoints with saved optimizer state (meta file)
+    metas = list(ckpt_dir.glob("step_*_meta.json"))
+    if metas:
+        return max(int(p.stem.replace("_meta", "").split("_")[1]) for p in metas)
+    # Fall back to model-only .eqx files
+    eqxs = [p for p in ckpt_dir.glob("step_*.eqx") if "_opt" not in p.name]
+    if eqxs:
+        return max(int(p.stem.split("_")[1]) for p in eqxs)
+    return None
+
+
+def _save_checkpoint(
+    ckpt_dir: Path,
+    completed: int,
+    model: HyperNetwork,
+    opt_state: optax.OptState,
+    rng: np.random.Generator,
+) -> None:
+    tag = _ckpt_tag(completed)
+    eqx.tree_serialise_leaves(str(ckpt_dir / f"{tag}.eqx"), model)
+    eqx.tree_serialise_leaves(str(ckpt_dir / f"{tag}_opt.eqx"), opt_state)
+    meta = {
+        "step": completed,
+        "numpy_rng_state": rng.bit_generator.state,
+    }
+    (ckpt_dir / f"{tag}_meta.json").write_text(json.dumps(meta))
+
+
+def _load_checkpoint(
+    ckpt_dir: Path,
+    step: int,
+    model_template: HyperNetwork,
+    opt_state_template: optax.OptState,
+) -> tuple[HyperNetwork, optax.OptState, np.random.Generator]:
+    tag = _ckpt_tag(step)
+    model = eqx.tree_deserialise_leaves(str(ckpt_dir / f"{tag}.eqx"), model_template)
+
+    opt_path = ckpt_dir / f"{tag}_opt.eqx"
+    if opt_path.exists():
+        opt_state = eqx.tree_deserialise_leaves(str(opt_path), opt_state_template)
+    else:
+        # Old checkpoint without saved opt state — fresh optimizer, different LR trajectory
+        opt_state = opt_state_template
+
+    rng = np.random.default_rng()
+    meta_path = ckpt_dir / f"{tag}_meta.json"
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text())
+        rng.bit_generator.state = meta["numpy_rng_state"]
+    else:
+        rng = np.random.default_rng(step)  # reproducible fallback
+
+    return model, opt_state, rng
+
+
+# ── loss / eval helpers ───────────────────────────────────────────────────────
+
 def _task_loss(
     model: HyperNetwork,
     c_encs: jax.Array,
@@ -110,9 +198,11 @@ def _mc_predict(
     """E_x[f(c_enc, x)] averaged over pre-drawn noise samples (n_mc, n_stimulus)."""
     per_x = jax.vmap(
         lambda x: jax.vmap(model, in_axes=(0, None))(c_encs, x)
-    )(x_samples)  # (n_mc, n_points)
-    return jnp.mean(per_x, axis=0)  # (n_points,)
+    )(x_samples)
+    return jnp.mean(per_x, axis=0)
 
+
+# ── visualisation / plotting ──────────────────────────────────────────────────
 
 def _visualize_hnn(
     model: HyperNetwork,
@@ -144,44 +234,34 @@ def _visualize_hnn(
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     kw = dict(origin="lower", extent=[-2, 2, -2, 2], vmin=0, vmax=ESCAPE_RADIUS, cmap="inferno")
-
     axes[0].imshow(true_grid, **kw)
     axes[0].set_title("True |z_T|")
     axes[1].imshow(pred_grid, **kw)
     axes[1].set_title(f"Predicted |z_T| (MC n={len(eval_x_samples)})")
-
     err = np.abs(true_grid - pred_grid)
     axes[2].imshow(err, origin="lower", extent=[-2, 2, -2, 2], cmap="hot")
     axes[2].set_title("Absolute error")
-
     for ax in axes:
         ax.axhline(0, color="white", lw=0.5, ls="--")
         ax.set_xlabel("Re(c)")
         ax.set_ylabel("Im(c)")
-
-    title = f"Step {step}" if step is not None else "Final"
-    fig.suptitle(f"HNN — {title}", fontsize=12)
+    fig.suptitle(f"HNN — {'Step ' + str(step) if step else 'Final'}", fontsize=12)
     plt.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(str(out_path), dpi=150)
     plt.close(fig)
 
 
-def plot_metrics(
-    metrics: list[dict[str, Any]],
-    baseline: float,
-    out_path: Path,
-) -> None:
+def plot_metrics(metrics: list[dict[str, Any]], baseline: float, out_path: Path) -> None:
     import matplotlib.pyplot as plt
 
-    steps      = [m["step"] for m in metrics]
-    train      = [m["train_loss"] for m in metrics]
-    test       = [m["test_loss"] for m in metrics]
-    param_std  = [m["param_std"] for m in metrics]
-    pred_std   = [m["pred_std"] for m in metrics]
+    steps     = [m["step"] for m in metrics]
+    train     = [m["train_loss"] for m in metrics]
+    test      = [m["test_loss"] for m in metrics]
+    param_std = [m["param_std"] for m in metrics]
+    pred_std  = [m["pred_std"] for m in metrics]
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 10))
-
     axes[0].plot(steps, train, label="train MSE", lw=1.5, color="tab:blue")
     axes[0].plot(steps, test,  label="test MSE",  lw=1.5, color="tab:orange")
     axes[0].axhline(baseline, color="gray", ls="--", lw=1, label=f"baseline ({baseline:.3f})")
@@ -191,57 +271,39 @@ def plot_metrics(
     axes[0].legend(fontsize=8)
     axes[0].grid(True, alpha=0.3, which="both")
     axes[0].set_title("HNN — loss")
-
     axes[1].plot(steps, param_std, lw=1.5, color="tab:purple")
     axes[1].set_ylabel("param std across x")
     axes[1].set_title("Target network parameter diversity")
     axes[1].grid(True, alpha=0.3)
-
     axes[2].plot(steps, pred_std, lw=1.5, color="tab:red")
     axes[2].set_ylabel("prediction std across x")
     axes[2].set_xlabel("step")
     axes[2].set_title("Target network functional diversity")
     axes[2].grid(True, alpha=0.3)
-
     plt.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(str(out_path), dpi=150)
     plt.close(fig)
 
 
+# ── main training loop ────────────────────────────────────────────────────────
+
 def train(cfg: HNNConfig) -> HyperNetwork:
     key = jax.random.PRNGKey(cfg.seed)
     k_model, k_train, k_test, k_noise, k_eval = jax.random.split(key, 5)
 
-    model = make_hypernetwork(
-        k_model,
-        K=cfg.K,
-        n_stimulus=cfg.n_stimulus,
-        node_vec_dim=cfg.node_vec_dim,
-        coord_net_hidden=cfg.coord_net_hidden,
-        target_hidden_dim=cfg.target_hidden_dim,
-        n_target_hidden_layers=cfg.n_target_hidden_layers,
-        target_is_rnn=cfg.target_is_rnn,
-        rnn_hidden_dim=cfg.rnn_hidden_dim,
-        rnn_depth=cfg.rnn_depth,
-        rnn_num_steps=cfg.rnn_num_steps,
-        init_scale=cfg.init_scale,
-        stim_ffn_hidden=cfg.stim_ffn_hidden,
-        stim_ffn_depth=cfg.stim_ffn_depth,
-    )
-
     data_dir = Path(cfg.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
-    (data_dir / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2))
+    ckpt_dir = data_dir / "checkpoints"
+
+    # Build model and optimizer (always from canonical init — opt state may be replaced below)
+    model = _make_model_template(cfg, k_model)
 
     print("Generating datasets...")
     c_train, t_train = make_dataset(cfg.n_train, cfg.num_steps, k_train, train=True, K=cfg.K)
     c_test,  t_test  = make_dataset(cfg.n_test,  cfg.num_steps, k_test,  train=False, K=cfg.K)
     const_baseline = float(jnp.mean((t_train - jnp.mean(t_train)) ** 2))
-    print(f"Constant-mean MSE baseline: {const_baseline:.4f}")
-    print(f"HNN trainable params: {n_trainable_params(model):,}")
 
-    # Fixed noise for eval — consistent metric across checkpoints
     eval_x_samples = jax.random.uniform(
         k_eval, (cfg.n_mc_eval, cfg.n_stimulus), minval=-1.0, maxval=1.0
     )
@@ -260,11 +322,36 @@ def train(cfg: HNNConfig) -> HyperNetwork:
         optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay),
     )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+    rng = np.random.default_rng(cfg.seed)
 
+    # ── Resume detection ──────────────────────────────────────────────────────
+    resume_step = _find_latest_checkpoint(ckpt_dir)
+    if resume_step is not None and resume_step >= cfg.n_steps:
+        print(f"Already complete at step {resume_step}; nothing to do.")
+        return _load_checkpoint(ckpt_dir, resume_step, model, opt_state)[0]
+
+    if resume_step is not None:
+        print(f"Resuming from step {resume_step} → {cfg.n_steps} ...")
+        model, opt_state, rng = _load_checkpoint(ckpt_dir, resume_step, model, opt_state)
+        metrics: list[dict[str, Any]] = [
+            m for m in json.loads((data_dir / "metrics.json").read_text())
+            if m["step"] <= resume_step
+        ]
+        start_step = resume_step
+    else:
+        print(f"Starting fresh → {cfg.n_steps} steps")
+        (data_dir / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2))
+        metrics = []
+        start_step = 0
+
+    print(f"Constant-mean MSE baseline: {const_baseline:.4f}")
+    print(f"HNN trainable params: {n_trainable_params(model):,}")
+
+    # ── JIT-compiled step ─────────────────────────────────────────────────────
     lambda_target_decay = cfg.lambda_target_decay
 
     @eqx.filter_jit
-    def step(
+    def do_step(
         model: HyperNetwork,
         opt_state: optax.OptState,
         c_b: jax.Array,
@@ -282,14 +369,11 @@ def train(cfg: HNNConfig) -> HyperNetwork:
         preds = _mc_predict(model, c_encs, eval_x_samples)
         return jnp.mean((preds - targets) ** 2)
 
-    rng = np.random.default_rng(cfg.seed)
     c_train_np = np.array(c_train)
     t_train_np = np.array(t_train)
 
-    metrics: list[dict[str, Any]] = []
-    ckpt_dir = data_dir / "checkpoints"
-
-    pbar = trange(cfg.n_steps, desc="steps")
+    # ── Training loop ─────────────────────────────────────────────────────────
+    pbar = trange(start_step, cfg.n_steps, desc="steps", initial=start_step, total=cfg.n_steps)
     for s in pbar:
         t0 = time.perf_counter()
 
@@ -297,12 +381,11 @@ def train(cfg: HNNConfig) -> HyperNetwork:
         x_samples = jax.random.uniform(
             subkey, (cfg.n_mc_train, cfg.n_stimulus), minval=-1.0, maxval=1.0
         )
-
         batch_idx = rng.choice(cfg.n_train, size=cfg.batch_size, replace=False)
         c_b = jnp.array(c_train_np[batch_idx])
         t_b = jnp.array(t_train_np[batch_idx])
 
-        model, opt_state, loss = step(model, opt_state, c_b, t_b, x_samples)
+        model, opt_state, loss = do_step(model, opt_state, c_b, t_b, x_samples)
 
         completed = s + 1
         if (completed % cfg.checkpoint_interval == 0) or (completed == cfg.n_steps):
@@ -311,17 +394,16 @@ def train(cfg: HNNConfig) -> HyperNetwork:
             diversity  = target_network_diversity(model, c_b, eval_x_samples)
             elapsed    = time.perf_counter() - t0
 
-            record: dict[str, Any] = {
+            metrics.append({
                 "step": completed,
                 "train_loss": train_loss,
                 "test_loss": test_loss,
                 **diversity,
-            }
-            metrics.append(record)
+            })
 
             ckpt_dir.mkdir(parents=True, exist_ok=True)
-            tag = f"step_{completed:05d}"
-            eqx.tree_serialise_leaves(str(ckpt_dir / f"{tag}.eqx"), model)
+            _save_checkpoint(ckpt_dir, completed, model, opt_state, rng)
+            tag = _ckpt_tag(completed)
             _visualize_hnn(model, cfg, ckpt_dir / f"{tag}_pred.png", eval_x_samples, step=completed)
 
             (data_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
@@ -341,22 +423,8 @@ def train(cfg: HNNConfig) -> HyperNetwork:
 
 
 def load_checkpoint(path: str | Path, cfg: HNNConfig) -> HyperNetwork:
-    key = jax.random.PRNGKey(cfg.seed)
-    template = make_hypernetwork(
-        key,
-        K=cfg.K,
-        n_stimulus=cfg.n_stimulus,
-        node_vec_dim=cfg.node_vec_dim,
-        coord_net_hidden=cfg.coord_net_hidden,
-        target_hidden_dim=cfg.target_hidden_dim,
-        n_target_hidden_layers=cfg.n_target_hidden_layers,
-        target_is_rnn=cfg.target_is_rnn,
-        rnn_hidden_dim=cfg.rnn_hidden_dim,
-        rnn_depth=cfg.rnn_depth,
-        rnn_num_steps=cfg.rnn_num_steps,
-        stim_ffn_hidden=cfg.stim_ffn_hidden,
-        stim_ffn_depth=cfg.stim_ffn_depth,
-    )
+    """Load a model checkpoint by explicit path."""
+    template = _make_model_template(cfg)
     return eqx.tree_deserialise_leaves(str(path), template)
 
 
