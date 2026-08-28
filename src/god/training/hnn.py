@@ -27,9 +27,9 @@ import numpy as np
 import optax
 from tqdm import trange
 
-from god.data import ESCAPE_RADIUS, make_dataset
-from god.encoding import K_DEFAULT
-from god.hnn import HyperNetwork, make_hypernetwork, n_trainable_params, target_network_diversity
+from god.datasets.mandelbrot import ESCAPE_RADIUS, K_DEFAULT, make_mandelbrot_dataset
+from god.models.hnn import HyperNetwork, make_hypernetwork, n_trainable_params, target_network_diversity
+from god.training.common import visualize_mandelbrot
 
 
 @dataclass
@@ -57,8 +57,8 @@ class HNNConfig:
     lr: float = 3e-4
     weight_decay: float = 0.01
     grad_clip: float = 1.0
-    n_mc_train: int = 8          # noise samples per step (same batch for all)
-    n_mc_eval: int = 32          # noise samples for eval / diversity metrics
+    n_mc_train: int = 8
+    n_mc_eval: int = 32
 
     # L2 regularisation on generated target net parameters
     lambda_target_decay: float = 1e-3
@@ -74,7 +74,7 @@ class HNNConfig:
     stim_ffn_hidden: int = 128
     stim_ffn_depth: int = 2
 
-    # RNN target network (matches standalone RNN defaults)
+    # RNN target network
     target_is_rnn: bool = True
     rnn_hidden_dim: int = 128
     rnn_depth: int = 2
@@ -113,11 +113,9 @@ def _make_model_template(cfg: HNNConfig, key: jax.Array | None = None) -> HyperN
 
 def _find_latest_checkpoint(ckpt_dir: Path) -> int | None:
     """Return the step number of the most recent checkpoint, or None."""
-    # Prefer checkpoints with saved optimizer state (meta file)
     metas = list(ckpt_dir.glob("step_*_meta.json"))
     if metas:
         return max(int(p.stem.replace("_meta", "").split("_")[1]) for p in metas)
-    # Fall back to model-only .eqx files
     eqxs = [p for p in ckpt_dir.glob("step_*.eqx") if "_opt" not in p.name]
     if eqxs:
         return max(int(p.stem.split("_")[1]) for p in eqxs)
@@ -154,7 +152,6 @@ def _load_checkpoint(
     if opt_path.exists():
         opt_state = eqx.tree_deserialise_leaves(str(opt_path), opt_state_template)
     else:
-        # Old checkpoint without saved opt state — fresh optimizer, different LR trajectory
         opt_state = opt_state_template
 
     rng = np.random.default_rng()
@@ -163,7 +160,7 @@ def _load_checkpoint(
         meta = json.loads(meta_path.read_text())
         rng.bit_generator.state = meta["numpy_rng_state"]
     else:
-        rng = np.random.default_rng(step)  # reproducible fallback
+        rng = np.random.default_rng(step)
 
     return model, opt_state, rng
 
@@ -174,7 +171,7 @@ def _task_loss(
     model: HyperNetwork,
     c_encs: jax.Array,
     targets: jax.Array,
-    x_samples: jax.Array,  # (n_mc, n_stimulus) — same batch for all networks
+    x_samples: jax.Array,
     lambda_target_decay: float = 0.0,
 ) -> jax.Array:
     def loss_for_x(x: jax.Array) -> jax.Array:
@@ -211,45 +208,12 @@ def _visualize_hnn(
     eval_x_samples: jax.Array,
     step: int | None = None,
 ) -> None:
-    import matplotlib.pyplot as plt
+    def predict(c_encs: jax.Array) -> jax.Array:
+        return _mc_predict(model, c_encs, eval_x_samples) * ESCAPE_RADIUS
 
-    from god.data import mandelbrot_mag
-    from god.encoding import encode
-
-    res = 300
-    re_vals = np.linspace(-2.0, 2.0, res)
-    im_vals = np.linspace(-2.0, 2.0, res)
-    RE, IM = np.meshgrid(re_vals, im_vals)
-    c_r = jnp.array(RE.ravel())
-    c_i = jnp.array(IM.ravel())
-
-    true_mags = jax.vmap(mandelbrot_mag, in_axes=(0, 0, None, None))(
-        c_r, c_i, cfg.num_steps, ESCAPE_RADIUS
-    )
-    c_encs = jax.vmap(encode, in_axes=(0, 0, None))(c_r, c_i, cfg.K)
-    pred_mags = _mc_predict(model, c_encs, eval_x_samples) * ESCAPE_RADIUS
-
-    true_grid = np.array(true_mags).reshape(res, res)
-    pred_grid = np.array(pred_mags).reshape(res, res)
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    kw = dict(origin="lower", extent=[-2, 2, -2, 2], vmin=0, vmax=ESCAPE_RADIUS, cmap="inferno")
-    axes[0].imshow(true_grid, **kw)
-    axes[0].set_title("True |z_T|")
-    axes[1].imshow(pred_grid, **kw)
-    axes[1].set_title(f"Predicted |z_T| (MC n={len(eval_x_samples)})")
-    err = np.abs(true_grid - pred_grid)
-    axes[2].imshow(err, origin="lower", extent=[-2, 2, -2, 2], cmap="hot")
-    axes[2].set_title("Absolute error")
-    for ax in axes:
-        ax.axhline(0, color="white", lw=0.5, ls="--")
-        ax.set_xlabel("Re(c)")
-        ax.set_ylabel("Im(c)")
-    fig.suptitle(f"HNN — {'Step ' + str(step) if step else 'Final'}", fontsize=12)
-    plt.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(str(out_path), dpi=150)
-    plt.close(fig)
+    n_mc = len(eval_x_samples)
+    title = f"HNN — {'Step ' + str(step) if step else 'Final'} (MC n={n_mc})"
+    visualize_mandelbrot(predict, out_path, cfg.num_steps, cfg.K, title)
 
 
 def plot_metrics(metrics: list[dict[str, Any]], baseline: float, out_path: Path) -> None:
@@ -290,18 +254,18 @@ def plot_metrics(metrics: list[dict[str, Any]], baseline: float, out_path: Path)
 
 def train(cfg: HNNConfig) -> HyperNetwork:
     key = jax.random.PRNGKey(cfg.seed)
-    k_model, k_train, k_test, k_noise, k_eval = jax.random.split(key, 5)
+    k_model, k_data, k_noise, k_eval = jax.random.split(key, 4)
 
     data_dir = Path(cfg.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = data_dir / "checkpoints"
 
-    # Build model and optimizer (always from canonical init — opt state may be replaced below)
     model = _make_model_template(cfg, k_model)
 
     print("Generating datasets...")
-    c_train, t_train = make_dataset(cfg.n_train, cfg.num_steps, k_train, train=True, K=cfg.K)
-    c_test,  t_test  = make_dataset(cfg.n_test,  cfg.num_steps, k_test,  train=False, K=cfg.K)
+    dataset = make_mandelbrot_dataset(cfg.n_train, cfg.n_test, cfg.num_steps, k_data, K=cfg.K)
+    c_train, t_train = dataset.train_inputs, dataset.train_targets
+    c_test,  t_test  = dataset.test_inputs,  dataset.test_targets
     const_baseline = float(jnp.mean((t_train - jnp.mean(t_train)) ** 2))
 
     eval_x_samples = jax.random.uniform(

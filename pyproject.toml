@@ -26,10 +26,10 @@ dependencies = [
 ]
 
 [project.scripts]
-god-mlp = "god.train_mlp:main"
-god-mlp-grokk = "god.train_mlp:main_grokk"
-god-pcn = "god.train_pcn:main"
-god-hnn = "god.train_hnn:main"
+god-mlp = "god.training.mlp:main"
+god-mlp-grokk = "god.training.mlp:main_grokk"
+god-pcn = "god.training.pcn:main"
+god-hnn = "god.training.hnn:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
@@ -37,3 +37,14 @@ build-backend = "uv_build"
 
 [tool.uv.sources]
 jpc = { git = "https://github.com/simondoesstuff/jpc" }
+
+[tool.pyright]
+typeCheckingMode = "standard"
+reportUnknownMemberType = "none"
+reportAny = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownLambdaType = "none"
+reportMissingTypeStubs = "none"
+reportPrivateImportUsage = "none"
+reportUnusedCallResult = "none"

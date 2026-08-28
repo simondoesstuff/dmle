@@ -1,1 +1,1 @@
-from god.train_mlp import main
+from god.training.mlp import main as main

@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, PRNGKeyArray
 
-from god.encoding import K_DEFAULT, enc_dim
+from god.datasets.mandelbrot import K_DEFAULT, enc_dim
 
 
 class CoordWeights(NamedTuple):
@@ -124,10 +124,7 @@ def _run_rnn_cell(
     num_steps: int,
     n_cell_layers: int,
 ) -> Float[Array, "enc_dim"]:
-    """Run the generated RNN cell for num_steps steps; return full h_T.
-
-    h_T[0] is the predicted mean (headless readout, same as standalone RNN convention).
-    """
+    """Run the generated RNN cell for num_steps steps; return full h_T."""
     def cell_step(h: Float[Array, "enc_dim"], _: None) -> tuple[Float[Array, "enc_dim"], None]:
         act = jnp.concatenate([h, x])
         for l in range(n_cell_layers):
@@ -139,7 +136,7 @@ def _run_rnn_cell(
 
 
 def _stimulus_to_coord_weights(
-    ffn: eqx.Module,
+    ffn: eqx.nn.MLP,
     stimulus: Float[Array, "n_stimulus"],
     embed_dim: int,
     coord_hidden: int,
@@ -164,11 +161,11 @@ class HyperNetwork(eqx.Module):
     # Static metadata (not pytree leaves)
     coord_net_hidden: int = eqx.field(static=True)
     coord_net_embed_dim: int = eqx.field(static=True)
-    param_layout: list = eqx.field(static=True)
-    n_target_layers: int = eqx.field(static=True)  # for FFN target; 0 if RNN
+    param_layout: list[tuple[str, tuple[int, ...]]] = eqx.field(static=True)
+    n_target_layers: int = eqx.field(static=True)
     target_is_rnn: bool = eqx.field(static=True)
-    n_cell_layers: int = eqx.field(static=True)    # RNN cell depth; 0 if FFN
-    rnn_num_steps: int = eqx.field(static=True)    # RNN recurrence steps; 0 if FFN
+    n_cell_layers: int = eqx.field(static=True)
+    rnn_num_steps: int = eqx.field(static=True)
 
     def target_params(
         self,
@@ -211,15 +208,12 @@ def make_hypernetwork(
     n_stimulus: int = 32,
     node_vec_dim: int = 16,
     coord_net_hidden: int = 32,
-    # FFN target params (used when target_is_rnn=False)
     target_hidden_dim: int = 32,
     n_target_hidden_layers: int = 2,
-    # RNN target params (used when target_is_rnn=True)
     target_is_rnn: bool = True,
     rnn_hidden_dim: int = 128,
     rnn_depth: int = 2,
     rnn_num_steps: int = 10,
-    # Shared
     init_scale: float = 0.1,
     stim_ffn_hidden: int = 128,
     stim_ffn_depth: int = 2,
@@ -261,6 +255,7 @@ def make_hypernetwork(
         activation=jax.nn.tanh,
         key=k1,
     )
+    assert stim_ffn.layers[-1].bias is not None
     stim_ffn = eqx.tree_at(
         lambda m: (m.layers[-1].weight, m.layers[-1].bias),
         stim_ffn,
@@ -303,17 +298,13 @@ def target_network_diversity(
     """Measure functional diversity of sampled target networks.
 
     Returns:
-        param_std:  mean per-parameter std across x samples — 0 means all
-                    generated networks have identical weights.
-        pred_std:   mean per-c_enc std of scalar outputs across x samples — 0
-                    means all networks produce identical predictions.
+        param_std:  mean per-parameter std across x samples.
+        pred_std:   mean per-c_enc std of scalar outputs across x samples.
         pred_range: mean range (max-min) of predictions across x samples.
     """
-    # Parameter diversity: (n_mc, n_params)
     all_params = jax.vmap(model.target_params)(x_samples)
     param_std = float(jnp.mean(jnp.std(all_params, axis=0)))
 
-    # Functional diversity: (n_mc, n_points)
     per_x_preds = jax.vmap(
         lambda x: jax.vmap(model, in_axes=(0, None))(c_encs, x)
     )(x_samples)

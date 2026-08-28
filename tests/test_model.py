@@ -1,8 +1,8 @@
 import jax
 import jax.numpy as jnp
 import equinox as eqx
-from god.encoding import enc_dim, encode, K_DEFAULT
-from god.model import RNNCell, MandelbrotRNN
+from god.datasets.mandelbrot import enc_dim, encode, K_DEFAULT
+from god.models.rnn import RNNCell, MandelbrotRNN
 
 
 ENC_DIM = enc_dim(K_DEFAULT)
@@ -21,7 +21,6 @@ def test_rnn_cell_output_shape():
 
 
 def test_rnn_cell_depth1_no_hidden():
-    # depth=1 goes directly 2d→d, hidden_dim is unused
     cell = RNNCell(ENC_DIM, hidden_dim=999, depth=1, key=KEY)
     assert len(cell.layers) == 1
     assert cell.layers[0].in_features == 2 * ENC_DIM

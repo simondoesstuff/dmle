@@ -4,8 +4,8 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 
-from god.encoding import enc_dim, encode, K_DEFAULT
-from god.hnn import (
+from god.datasets.mandelbrot import enc_dim, encode, make_mandelbrot_dataset, K_DEFAULT
+from god.models.hnn import (
     HyperNetwork,
     _all_param_values,
     _build_param_embeddings,
@@ -122,14 +122,13 @@ def test_diversity_metrics_at_init():
 
 
 def test_loss_is_finite_at_init():
-    from god.data import make_dataset
-    from god.train_hnn import _task_loss
+    from god.training.hnn import _task_loss
 
     model = make_hypernetwork(KEY)
     k1, k2 = jax.random.split(KEY)
-    c_encs, targets = make_dataset(64, 5, k1, train=True)
+    ds = make_mandelbrot_dataset(64, 8, 5, k1)
     x_samples = _x_samples(8, k2)
-    loss = _task_loss(model, c_encs, targets, x_samples)
+    loss = _task_loss(model, ds.train_inputs, ds.train_targets, x_samples)
     assert jnp.isfinite(loss)
 
 
@@ -146,15 +145,15 @@ def test_n_trainable_params():
 def test_step_updates_stim_ffn():
     """A training step must change stim_ffn weights."""
     import optax
-    from god.train_hnn import _task_loss, HNNConfig
-    from god.data import make_dataset
+    from god.training.hnn import _task_loss, HNNConfig
 
     cfg = HNNConfig(n_train=32, num_steps=5, seed=1)
     key = jax.random.PRNGKey(cfg.seed)
-    k_model, k_train, k_noise = jax.random.split(key, 3)
+    k_model, k_data, k_noise = jax.random.split(key, 3)
 
     model = make_hypernetwork(k_model)
-    c_train, t_train = make_dataset(cfg.n_train, cfg.num_steps, k_train, train=True)
+    ds = make_mandelbrot_dataset(cfg.n_train, 8, cfg.num_steps, k_data)
+    c_train, t_train = ds.train_inputs, ds.train_targets
     w_before = model.stimulus_to_coord_params.layers[0].weight.copy()
 
     opt = optax.adamw(learning_rate=1e-3)

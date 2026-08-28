@@ -19,11 +19,9 @@ import numpy as np
 import optax
 from tqdm import trange
 
-from god.data import ESCAPE_RADIUS, make_dataset
-from god.encoding import K_DEFAULT, enc_dim
-from god.model import MandelbrotRNN
-
-_LR_FLOOR = 1e-9
+from god.datasets.mandelbrot import ESCAPE_RADIUS, K_DEFAULT, enc_dim, make_mandelbrot_dataset
+from god.models.rnn import MandelbrotRNN
+from god.training.common import checkpoint_interval, plot_metrics_standard, visualize_mandelbrot
 
 
 @dataclass
@@ -46,8 +44,8 @@ class TrainConfig:
     batch_size: int = 64
     n_epochs: int = 12_000
     lr_peak: float = 1e-4
-    warmup_frac: float = 0.0   # 0 → constant LR; >0 → warmup then cosine decay
-    lr_end: float = 1e-4       # equal to lr_peak → constant; 0.0 → cosine-to-zero
+    warmup_frac: float = 0.0
+    lr_end: float = 1e-4
     weight_decay: float = 0.5
     grad_clip: float = 1.0
 
@@ -75,12 +73,6 @@ def simple_config() -> TrainConfig:
     )
 
 
-def _checkpoint_interval(current_lr: float, cfg: TrainConfig) -> int:
-    effective_lr = max(current_lr, _LR_FLOOR)
-    raw = round(cfg.checkpoint_min_interval * cfg.lr_peak / effective_lr)
-    return int(np.clip(raw, cfg.checkpoint_min_interval, cfg.checkpoint_max_interval))
-
-
 def _loss_fn(
     model: MandelbrotRNN,
     c_encs: jax.Array,
@@ -97,93 +89,12 @@ def _visualize_model(
     out_path: Path,
     epoch: int | None = None,
 ) -> None:
-    import matplotlib.pyplot as plt
+    def predict(c_encs: jax.Array) -> jax.Array:
+        h_T = jax.vmap(model)(c_encs)
+        return jax.vmap(model.predict_magnitude)(h_T)
 
-    from god.data import mandelbrot_mag
-    from god.encoding import encode
-
-    res = 300
-    re_vals = np.linspace(-2.0, 2.0, res)
-    im_vals = np.linspace(-2.0, 2.0, res)
-    RE, IM = np.meshgrid(re_vals, im_vals)
-    c_r = jnp.array(RE.ravel())
-    c_i = jnp.array(IM.ravel())
-
-    true_mags = jax.vmap(mandelbrot_mag, in_axes=(0, 0, None, None))(
-        c_r, c_i, cfg.num_steps, ESCAPE_RADIUS
-    )
-    c_encs = jax.vmap(encode, in_axes=(0, 0, None))(c_r, c_i, cfg.K)
-    h_T = jax.vmap(model)(c_encs)
-    pred_mags = jax.vmap(model.predict_magnitude)(h_T)
-
-    true_grid = np.array(true_mags).reshape(res, res)
-    pred_grid = np.array(pred_mags).reshape(res, res)
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    kw = dict(origin="lower", extent=[-2, 2, -2, 2], vmin=0, vmax=ESCAPE_RADIUS, cmap="inferno")
-
-    axes[0].imshow(true_grid, **kw)
-    axes[0].set_title("True |z_T|")
-    axes[1].imshow(pred_grid, **kw)
-    axes[1].set_title("Predicted |z_T|")
-
-    err = np.abs(true_grid - pred_grid)
-    axes[2].imshow(err, origin="lower", extent=[-2, 2, -2, 2], cmap="hot")
-    axes[2].set_title("Absolute error")
-
-    for ax in axes:
-        ax.axhline(0, color="white", lw=0.5, ls="--")
-        ax.set_xlabel("Re(c)")
-        ax.set_ylabel("Im(c)")
-
-    fig.suptitle(f"Epoch {epoch}" if epoch is not None else "Final", fontsize=12)
-    plt.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(str(out_path), dpi=150)
-    plt.close(fig)
-
-
-def plot_metrics(
-    metrics: list[dict[str, Any]],
-    baseline: float,
-    out_path: Path,
-) -> None:
-    import matplotlib.pyplot as plt
-
-    epochs = [m["epoch"] for m in metrics]
-    train = [m["train_loss"] for m in metrics]
-    test = [m["test_loss"] for m in metrics]
-    lrs = [m["lr"] for m in metrics]
-    ckpt_epochs = [m["epoch"] for m in metrics if m.get("checkpoint", False)]
-
-    fig, ax1 = plt.subplots(figsize=(12, 5))
-    ax2 = ax1.twinx()
-
-    ax1.plot(epochs, train, label="train MSE", lw=1.5, color="tab:blue")
-    ax1.plot(epochs, test, label="test MSE", lw=1.5, color="tab:orange")
-    ax1.axhline(baseline, color="gray", ls="--", lw=1, label=f"const baseline ({baseline:.3f})")
-    ax1.set_xscale("log")
-    ax1.set_yscale("log")
-    ax1.set_xlabel("epoch (log)")
-    ax1.set_ylabel("MSE (log)")
-
-    ax2.plot(epochs, lrs, color="tab:green", lw=0.8, alpha=0.35, label="LR")
-    ax2.set_ylabel("learning rate")
-    ax2.set_ylim(bottom=0)
-
-    for e in ckpt_epochs:
-        ax1.axvline(e, color="lightgray", lw=0.3, alpha=0.5)
-
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=8)
-    ax1.set_title("Mandelbrot RNN — training (log–log)")
-    ax1.grid(True, alpha=0.3, which="both")
-
-    plt.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(str(out_path), dpi=150)
-    plt.close(fig)
+    title = f"Epoch {epoch}" if epoch is not None else "Final"
+    visualize_mandelbrot(predict, out_path, cfg.num_steps, cfg.K, title)
 
 
 def load_checkpoint(path: str | Path, cfg: TrainConfig) -> MandelbrotRNN:
@@ -197,7 +108,7 @@ def load_checkpoint(path: str | Path, cfg: TrainConfig) -> MandelbrotRNN:
 
 def train(cfg: TrainConfig) -> MandelbrotRNN:
     key = jax.random.PRNGKey(cfg.seed)
-    k_model, k_train, k_test = jax.random.split(key, 3)
+    k_model, k_data = jax.random.split(key)
 
     d = enc_dim(cfg.K)
     model = MandelbrotRNN(
@@ -210,8 +121,9 @@ def train(cfg: TrainConfig) -> MandelbrotRNN:
     (data_dir / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2))
 
     print("Generating datasets...")
-    c_train, t_train = make_dataset(cfg.n_train, cfg.num_steps, k_train, train=True, K=cfg.K)
-    c_test, t_test = make_dataset(cfg.n_test, cfg.num_steps, k_test, train=False, K=cfg.K)
+    dataset = make_mandelbrot_dataset(cfg.n_train, cfg.n_test, cfg.num_steps, k_data, K=cfg.K)
+    c_train, t_train = dataset.train_inputs, dataset.train_targets
+    c_test, t_test = dataset.test_inputs, dataset.test_targets
     const_baseline = float(jnp.mean((t_train - jnp.mean(t_train)) ** 2))
     print(f"Constant-mean MSE baseline: {const_baseline:.4f}")
 
@@ -290,7 +202,7 @@ def train(cfg: TrainConfig) -> MandelbrotRNN:
         elapsed = time.perf_counter() - t0
 
         completed = epoch + 1
-        current_lr = float(schedule(completed * steps_per_epoch))
+        current_lr = float(jnp.asarray(schedule(completed * steps_per_epoch)))
 
         record: dict[str, Any] = {
             "epoch": completed,
@@ -299,7 +211,9 @@ def train(cfg: TrainConfig) -> MandelbrotRNN:
             "lr": current_lr,
         }
 
-        interval = _checkpoint_interval(current_lr, cfg)
+        interval = checkpoint_interval(
+            current_lr, cfg.lr_peak, cfg.checkpoint_min_interval, cfg.checkpoint_max_interval
+        )
         is_last = completed == cfg.n_epochs
         if completed - last_checkpoint_epoch >= interval or is_last:
             record["checkpoint"] = True
@@ -313,7 +227,10 @@ def train(cfg: TrainConfig) -> MandelbrotRNN:
 
         if record.get("checkpoint"):
             (data_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
-            plot_metrics(metrics, const_baseline, data_dir / "train_curve.png")
+            plot_metrics_standard(
+                metrics, const_baseline, data_dir / "train_curve.png",
+                "Mandelbrot RNN — training (log–log)",
+            )
 
         pbar.set_postfix(
             train=f"{train_loss:.4f}",
@@ -323,7 +240,10 @@ def train(cfg: TrainConfig) -> MandelbrotRNN:
         )
 
     (data_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
-    plot_metrics(metrics, const_baseline, data_dir / "train_curve.png")
+    plot_metrics_standard(
+        metrics, const_baseline, data_dir / "train_curve.png",
+        "Mandelbrot RNN — training (log–log)",
+    )
     print(f"Metrics → {data_dir / 'metrics.json'}")
     print(f"Train curve → {data_dir / 'train_curve.png'}")
 

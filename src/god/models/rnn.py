@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import equinox as eqx
 from jaxtyping import Array, Float, PRNGKeyArray
 
-from god.encoding import SCALE, _EPS
+from god.datasets.mandelbrot import SCALE, EPS
 
 
 class RNNCell(eqx.Module):
@@ -90,8 +90,8 @@ class MandelbrotRNN(eqx.Module):
     def predict_magnitude(self, h_T: Float[Array, "d"]) -> Float[Array, ""]:
         """Map h_T to a predicted Mandelbrot magnitude (Mandelbrot scale)."""
         if self.head is not None:
-            out = self.head(h_T)          # (2,) — (re, im) in normalised scale
+            out = self.head(h_T)
             re, im = out[0] * SCALE, out[1] * SCALE
         else:
             re, im = h_T[0] * SCALE, h_T[1] * SCALE
-        return jnp.sqrt(re**2 + im**2 + _EPS**2)
+        return jnp.sqrt(re**2 + im**2 + EPS**2)

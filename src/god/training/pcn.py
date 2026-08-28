@@ -37,27 +37,26 @@ import optax
 from jaxtyping import Array, Float
 from tqdm import trange
 
-from god.data import ESCAPE_RADIUS, make_dataset
-from god.encoding import K_DEFAULT, enc_dim
-
-DATA_DIR = Path("data/mandel/pcn")
-
-_LR_FLOOR = 1e-9
+from god.datasets.mandelbrot import ESCAPE_RADIUS, K_DEFAULT, enc_dim, make_mandelbrot_dataset
+from god.training.common import checkpoint_interval, plot_metrics_standard, visualize_mandelbrot
 
 
 @dataclass
 class PCNConfig:
+    # Paths
+    data_dir: str = "data/mandel/pcn"
+
     # Model
     K: int = K_DEFAULT
     hidden_dim: int = 128
-    depth: int = 10      # number of MLP layers (each layer = one hierarchy level)
+    depth: int = 10
     use_bias: bool = True
     act_fn: str = "tanh"
 
     # Data
     n_train: int = 10_000
     n_test: int = 2_000
-    num_steps: int = 10  # used only for data generation (Mandelbrot iterations)
+    num_steps: int = 10
 
     # Training
     batch_size: int = 256
@@ -68,7 +67,7 @@ class PCNConfig:
     grad_clip: float = 1.0
 
     # PC inference
-    max_t1: int = 20  # max integration time for PC inference ODE
+    max_t1: int = 20
 
     # Checkpointing
     checkpoint_min_interval: int = 10
@@ -78,15 +77,11 @@ class PCNConfig:
 
 
 @eqx.filter_jit
-def _tie_hidden_layers(model: list) -> list:
-    """Project to weight-tied manifold by averaging hidden layer parameters.
-
-    Only layers 1..depth-2 (width×width) are tied; the input projection
-    (enc_dim→width) and output head (width→1) are left free.
-    """
+def _tie_hidden_layers(model: list[Any]) -> list[Any]:
+    """Project to weight-tied manifold by averaging hidden layer parameters."""
     depth = len(model)
     if depth <= 3:
-        return model  # 0 or 1 hidden layer — nothing to average
+        return model
     hidden = list(range(1, depth - 1))
     W_avg = jnp.mean(jnp.stack([model[i].layers[1].weight for i in hidden]), axis=0)
     for i in hidden:
@@ -98,19 +93,13 @@ def _tie_hidden_layers(model: list) -> list:
     return model
 
 
-def _checkpoint_interval(current_lr: float, cfg: PCNConfig) -> int:
-    effective_lr = max(current_lr, _LR_FLOOR)
-    raw = round(cfg.checkpoint_min_interval * cfg.lr_peak / effective_lr)
-    return int(np.clip(raw, cfg.checkpoint_min_interval, cfg.checkpoint_max_interval))
-
-
 def _pcn_predict(
-    model: list,
+    model: list[Any],
     c_encs: Float[Array, "n d"],
 ) -> Float[Array, "n"]:
     """Feedforward prediction (no inference loop) — used for eval and visualisation."""
     acts = jpc.init_activities_with_ffwd(model=model, input=c_encs)
-    return acts[-1].squeeze(-1)  # (n,)
+    return acts[-1].squeeze(-1)
 
 
 def _mse(preds: Float[Array, "n"], targets: Float[Array, "n"]) -> float:
@@ -118,98 +107,21 @@ def _mse(preds: Float[Array, "n"], targets: Float[Array, "n"]) -> float:
 
 
 def _visualize_pcn(
-    model: list,
+    model: list[Any],
     cfg: PCNConfig,
     out_path: Path,
     epoch: int | None = None,
 ) -> None:
-    import matplotlib.pyplot as plt
-    from god.data import mandelbrot_mag
-    from god.encoding import encode
+    def predict(c_encs: jax.Array) -> jax.Array:
+        return _pcn_predict(model, c_encs) * ESCAPE_RADIUS
 
-    res = 300
-    re_vals = np.linspace(-2.0, 2.0, res)
-    im_vals = np.linspace(-2.0, 2.0, res)
-    RE, IM = np.meshgrid(re_vals, im_vals)
-    c_r = jnp.array(RE.ravel())
-    c_i = jnp.array(IM.ravel())
-
-    true_mags = jax.vmap(mandelbrot_mag, in_axes=(0, 0, None, None))(
-        c_r, c_i, cfg.num_steps, ESCAPE_RADIUS
-    )
-    c_encs = jax.vmap(encode, in_axes=(0, 0, None))(c_r, c_i, cfg.K)
-    pred_mags_norm = _pcn_predict(model, c_encs)
-    pred_mags = pred_mags_norm * ESCAPE_RADIUS
-
-    true_grid = np.array(true_mags).reshape(res, res)
-    pred_grid = np.array(pred_mags).reshape(res, res)
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    kw = dict(origin="lower", extent=[-2, 2, -2, 2], vmin=0, vmax=ESCAPE_RADIUS, cmap="inferno")
-    axes[0].imshow(true_grid, **kw)
-    axes[0].set_title("True |z_T|")
-    axes[1].imshow(pred_grid, **kw)
-    axes[1].set_title("Predicted |z_T|")
-    err = np.abs(true_grid - pred_grid)
-    axes[2].imshow(err, origin="lower", extent=[-2, 2, -2, 2], cmap="hot")
-    axes[2].set_title("Absolute error")
-    for ax in axes:
-        ax.axhline(0, color="white", lw=0.5, ls="--")
-        ax.set_xlabel("Re(c)")
-        ax.set_ylabel("Im(c)")
-    fig.suptitle(f"PCN — Epoch {epoch}" if epoch is not None else "PCN — Final", fontsize=12)
-    plt.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(str(out_path), dpi=150)
-    plt.close(fig)
+    title = f"PCN — Epoch {epoch}" if epoch is not None else "PCN — Final"
+    visualize_mandelbrot(predict, out_path, cfg.num_steps, cfg.K, title)
 
 
-def plot_metrics(
-    metrics: list[dict[str, Any]],
-    baseline: float,
-    out_path: Path,
-) -> None:
-    import matplotlib.pyplot as plt
-
-    epochs = [m["epoch"] for m in metrics]
-    train = [m["train_loss"] for m in metrics]
-    test = [m["test_loss"] for m in metrics]
-    lrs = [m["lr"] for m in metrics]
-    ckpt_epochs = [m["epoch"] for m in metrics if m.get("checkpoint", False)]
-
-    fig, ax1 = plt.subplots(figsize=(12, 5))
-    ax2 = ax1.twinx()
-
-    ax1.plot(epochs, train, label="train MSE", lw=1.5, color="tab:blue")
-    ax1.plot(epochs, test, label="test MSE", lw=1.5, color="tab:orange")
-    ax1.axhline(baseline, color="gray", ls="--", lw=1, label=f"const baseline ({baseline:.3f})")
-    ax1.set_xscale("log")
-    ax1.set_yscale("log")
-    ax1.set_xlabel("epoch (log)")
-    ax1.set_ylabel("MSE (log)")
-
-    ax2.plot(epochs, lrs, color="tab:green", lw=0.8, alpha=0.35, label="LR")
-    ax2.set_ylabel("learning rate")
-    ax2.set_ylim(bottom=0)
-
-    for e in ckpt_epochs:
-        ax1.axvline(e, color="lightgray", lw=0.3, alpha=0.5)
-
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=8)
-    ax1.set_title("Mandelbrot PCN — grokking study (log–log)")
-    ax1.grid(True, alpha=0.3, which="both")
-
-    plt.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(str(out_path), dpi=150)
-    plt.close(fig)
-
-
-def train(cfg: PCNConfig) -> list:
+def train(cfg: PCNConfig) -> list[Any]:
     key = jax.random.PRNGKey(cfg.seed)
-    k_model, k_train, k_test = jax.random.split(key, 3)
+    k_model, k_data = jax.random.split(key)
 
     d = enc_dim(cfg.K)
     model = jpc.make_mlp(
@@ -221,17 +133,17 @@ def train(cfg: PCNConfig) -> list:
         act_fn=cfg.act_fn,
         use_bias=cfg.use_bias,
     )
-    model = _tie_hidden_layers(model)  # start on the constraint manifold
+    model = _tie_hidden_layers(model)
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    (DATA_DIR / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2))
+    data_dir = Path(cfg.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2))
 
     print("Generating datasets...")
-    c_train, t_train = make_dataset(cfg.n_train, cfg.num_steps, k_train, train=True, K=cfg.K)
-    c_test, t_test = make_dataset(cfg.n_test, cfg.num_steps, k_test, train=False, K=cfg.K)
-    # JPC mse_loss expects (batch, output_dim) targets
-    t_train_jpc = t_train[:, None]  # (n, 1)
-    t_test_jpc = t_test[:, None]
+    dataset = make_mandelbrot_dataset(cfg.n_train, cfg.n_test, cfg.num_steps, k_data, K=cfg.K)
+    c_train, t_train = dataset.train_inputs, dataset.train_targets
+    c_test, t_test = dataset.test_inputs, dataset.test_targets
+    t_train_jpc = t_train[:, None]
 
     const_baseline = float(jnp.mean((t_train - jnp.mean(t_train)) ** 2))
     print(f"Constant-mean MSE baseline: {const_baseline:.4f}")
@@ -251,12 +163,10 @@ def train(cfg: PCNConfig) -> list:
         optax.clip_by_global_norm(cfg.grad_clip),
         optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay),
     )
-    # JPC internally calls optim.update(params=(model, skip_model)), so the
-    # optimizer must be initialized with the same (model, None) tuple structure.
     opt_state = optimizer.init(eqx.filter((model, None), eqx.is_array))
 
     @eqx.filter_jit
-    def eval_mse(model: list, c_encs: jax.Array, targets: jax.Array) -> jax.Array:
+    def eval_mse(model: list[Any], c_encs: jax.Array, targets: jax.Array) -> jax.Array:
         preds = _pcn_predict(model, c_encs)
         return jnp.mean((preds - targets) ** 2)
 
@@ -273,7 +183,7 @@ def train(cfg: PCNConfig) -> list:
     print(f"Training: {cfg.n_train} samples, {steps_per_epoch} steps/epoch, {cfg.n_epochs} epochs")
 
     metrics: list[dict[str, Any]] = []
-    ckpt_dir = DATA_DIR / "checkpoints"
+    ckpt_dir = data_dir / "checkpoints"
     last_checkpoint_epoch = 0
 
     pbar = trange(cfg.n_epochs, desc="epochs")
@@ -285,7 +195,7 @@ def train(cfg: PCNConfig) -> list:
         for i in range(steps_per_epoch):
             batch_idx = idx[i * cfg.batch_size : (i + 1) * cfg.batch_size]
             c_b = jnp.array(c_train_np[batch_idx])
-            t_b = jnp.array(t_train_jpc_np[batch_idx])  # (batch, 1)
+            t_b = jnp.array(t_train_jpc_np[batch_idx])
             result = jpc.make_pc_step(
                 model=model,
                 optim=optimizer,
@@ -294,11 +204,9 @@ def train(cfg: PCNConfig) -> list:
                 input=c_b,
                 loss_id="mse",
                 max_t1=cfg.max_t1,
-                # weight_decay handled by optax.adamw; don't double-apply here
             )
             model = _tie_hidden_layers(result["model"])
             opt_state = result["opt_state"]
-            # JPC loss = 0.5 * mean(sum(...)); convert to plain MSE for tracking
             epoch_loss += float(result["loss"]) * 2.0
 
         train_loss = epoch_loss / steps_per_epoch
@@ -306,7 +214,7 @@ def train(cfg: PCNConfig) -> list:
         elapsed = time.perf_counter() - t0
 
         completed = epoch + 1
-        current_lr = float(schedule(completed * steps_per_epoch))
+        current_lr = float(jnp.asarray(schedule(completed * steps_per_epoch)))
 
         record: dict[str, Any] = {
             "epoch": completed,
@@ -315,7 +223,9 @@ def train(cfg: PCNConfig) -> list:
             "lr": current_lr,
         }
 
-        interval = _checkpoint_interval(current_lr, cfg)
+        interval = checkpoint_interval(
+            current_lr, cfg.lr_peak, cfg.checkpoint_min_interval, cfg.checkpoint_max_interval
+        )
         is_last = completed == cfg.n_epochs
         if completed - last_checkpoint_epoch >= interval or is_last:
             record["checkpoint"] = True
@@ -328,8 +238,11 @@ def train(cfg: PCNConfig) -> list:
         metrics.append(record)
 
         if record.get("checkpoint"):
-            (DATA_DIR / "metrics.json").write_text(json.dumps(metrics, indent=2))
-            plot_metrics(metrics, const_baseline, DATA_DIR / "train_curve.png")
+            (data_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+            plot_metrics_standard(
+                metrics, const_baseline, data_dir / "train_curve.png",
+                "Mandelbrot PCN — grokking study (log–log)",
+            )
 
         pbar.set_postfix(
             train=f"{train_loss:.4f}",
@@ -338,16 +251,19 @@ def train(cfg: PCNConfig) -> list:
             s=f"{elapsed:.1f}s",
         )
 
-    (DATA_DIR / "metrics.json").write_text(json.dumps(metrics, indent=2))
-    plot_metrics(metrics, const_baseline, DATA_DIR / "train_curve.png")
-    print(f"Metrics → {DATA_DIR / 'metrics.json'}")
-    print(f"Train curve → {DATA_DIR / 'train_curve.png'}")
+    (data_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    plot_metrics_standard(
+        metrics, const_baseline, data_dir / "train_curve.png",
+        "Mandelbrot PCN — grokking study (log–log)",
+    )
+    print(f"Metrics → {data_dir / 'metrics.json'}")
+    print(f"Train curve → {data_dir / 'train_curve.png'}")
 
     return model
 
 
-def visualize(model: list, cfg: PCNConfig) -> None:
-    out = DATA_DIR / "mandelbrot_prediction.png"
+def visualize(model: list[Any], cfg: PCNConfig) -> None:
+    out = Path(cfg.data_dir) / "mandelbrot_prediction.png"
     _visualize_pcn(model, cfg, out)
     print(f"Saved {out}")
 
