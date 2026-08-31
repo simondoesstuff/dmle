@@ -30,6 +30,7 @@ god-mlp = "god.training.mlp:main"
 god-mlp-grokk = "god.training.mlp:main_grokk"
 god-pcn = "god.training.pcn:main"
 god-hnn = "god.training.hnn:main"
+god-ffn-step = "god.training.ffn_step:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
