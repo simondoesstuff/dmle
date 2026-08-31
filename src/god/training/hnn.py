@@ -39,17 +39,20 @@ class HNNConfig:
     # Encoding
     K: int = K_DEFAULT
 
-    # Architecture
-    n_stimulus: int = 32
-    node_vec_dim: int = 16
-    coord_net_hidden: int = 32
-    target_hidden_dim: int = 32
-    n_target_hidden_layers: int = 2
+    # Target RNN cell — depth=1: one hidden tanh layer + linear output (TanhFFN convention)
+    n_stimulus: int = 16
+    rnn_hidden_dim: int = 16
+    rnn_depth: int = 1
+
+    # Stimulus FFN
+    stim_ffn_hidden: int = 64
+    stim_ffn_depth: int = 1
+    init_scale: float = 0.1
 
     # Data
     n_train: int = 10_000
     n_test: int = 2_000
-    num_steps: int = 10
+    num_steps: int = 10  # Mandelbrot iterations = RNN recurrences
 
     # Training
     n_steps: int = 150_000
@@ -66,19 +69,6 @@ class HNNConfig:
     # Cosine annealing LR with warmup
     warmup_frac: float = 0.3
     lr_end_frac: float = 0.01
-
-    # Architecture init
-    init_scale: float = 0.1
-
-    # Stimulus FFN
-    stim_ffn_hidden: int = 128
-    stim_ffn_depth: int = 2
-
-    # RNN target network
-    target_is_rnn: bool = True
-    rnn_hidden_dim: int = 128
-    rnn_depth: int = 2
-    rnn_num_steps: int = 10
 
     checkpoint_interval: int = 500
     seed: int = 0
@@ -97,17 +87,12 @@ def _make_model_template(cfg: HNNConfig, key: jax.Array | None = None) -> HyperN
         key,
         K=cfg.K,
         n_stimulus=cfg.n_stimulus,
-        node_vec_dim=cfg.node_vec_dim,
-        coord_net_hidden=cfg.coord_net_hidden,
-        target_hidden_dim=cfg.target_hidden_dim,
-        n_target_hidden_layers=cfg.n_target_hidden_layers,
-        target_is_rnn=cfg.target_is_rnn,
         rnn_hidden_dim=cfg.rnn_hidden_dim,
         rnn_depth=cfg.rnn_depth,
-        rnn_num_steps=cfg.rnn_num_steps,
-        init_scale=cfg.init_scale,
+        rnn_num_steps=cfg.num_steps,
         stim_ffn_hidden=cfg.stim_ffn_hidden,
         stim_ffn_depth=cfg.stim_ffn_depth,
+        init_scale=cfg.init_scale,
     )
 
 

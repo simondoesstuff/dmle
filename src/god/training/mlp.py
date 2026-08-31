@@ -29,10 +29,10 @@ class TrainConfig:
     # Paths
     data_dir: str = "data/mandel/mlp_grokk"
 
-    # Model
+    # Model — depth=1: one hidden tanh layer + linear output (TanhFFN convention)
     K: int = K_DEFAULT
-    hidden_dim: int = 128
-    depth: int = 2
+    hidden_dim: int = 16
+    depth: int = 1
     num_steps: int = 10
     linear_head: bool = False
 
@@ -61,6 +61,8 @@ def simple_config() -> TrainConfig:
     """Baseline MLP: large dataset, cosine LR with warmup, standard regularisation."""
     return TrainConfig(
         data_dir="data/mandel/mlp",
+        hidden_dim=16,
+        depth=1,
         n_train=10_000,
         batch_size=256,
         n_epochs=3_000,

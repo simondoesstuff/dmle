@@ -1,16 +1,13 @@
-"""Tests for the HyperNetwork architecture."""
+"""Tests for the simplified HyperNetwork (direct parameter generation)."""
 
 import jax
 import jax.numpy as jnp
 import equinox as eqx
+import optax
 
 from god.datasets.mandelbrot import enc_dim, encode, make_mandelbrot_dataset, K_DEFAULT
 from god.models.hnn import (
     HyperNetwork,
-    _all_param_values,
-    _build_param_embeddings,
-    _coord_net_forward,
-    _stimulus_to_coord_weights,
     _unflatten_target_params,
     make_hypernetwork,
     n_trainable_params,
@@ -19,37 +16,39 @@ from god.models.hnn import (
 
 KEY = jax.random.PRNGKey(0)
 D = enc_dim(K_DEFAULT)  # 18
-N_STIMULUS = 32
+N_STIMULUS = 16
 
 
 def _x_samples(n: int = 8, key=KEY) -> jax.Array:
     return jax.random.uniform(key, (n, N_STIMULUS), minval=-1.0, maxval=1.0)
 
 
-# ── param embeddings ─────────────────────────────────────────────────────────
+# ── model construction ────────────────────────────────────────────────────────
 
 
-def test_param_embeddings_shape():
+def test_make_hypernetwork_default():
     model = make_hypernetwork(KEY)
-    # Default: RNN target, enc_dim=18, rnn_hidden_dim=128, rnn_depth=2 (headless)
-    # Cell dims: [36, 128, 18]
-    cell_dims = [36, 128, 18]
+    assert isinstance(model, HyperNetwork)
+    assert model.rnn_num_steps == 10
+    assert model.n_cell_layers == 2  # rnn_depth=1 → 1 hidden + 1 linear
+
+
+def test_param_layout_matches_target_dims():
+    model = make_hypernetwork(KEY, rnn_hidden_dim=16, rnn_depth=1)
+    # Cell dims: [2*18=36, 16, 18]
+    # W0: (16, 36), b0: (16,), W1: (18, 16), b1: (18,)
+    expected = [("W0", (16, 36)), ("b0", (16,)), ("W1", (18, 16)), ("b1", (18,))]
+    assert model.param_layout == expected
+
+
+def test_stimulus_ffn_output_matches_n_target_params():
+    model = make_hypernetwork(KEY, rnn_hidden_dim=16, rnn_depth=1)
     n_params = sum(
-        (out_sz * in_sz + out_sz)
-        for in_sz, out_sz in zip(cell_dims, cell_dims[1:])
+        jax.numpy.prod(jax.numpy.array(shape)) for _, shape in model.param_layout
     )
-    embed_dim = 34  # 2 × (node_vec_dim=16 + 1)
-    assert model.param_embeddings.shape == (n_params, embed_dim)
-
-
-def test_param_embeddings_are_frozen():
-    """stop_gradient must zero out the grad through param_embeddings."""
-    model = make_hypernetwork(KEY)
-    c_enc = encode(jnp.array(0.3), jnp.array(-0.4))
     x = _x_samples(1)[0]
-
-    grads = eqx.filter_grad(lambda m: m(c_enc, x))(model)
-    assert jnp.all(grads.param_embeddings == 0.0)
+    flat = model.target_params(x)
+    assert flat.shape == (int(n_params),)
 
 
 # ── HyperNetwork forward ─────────────────────────────────────────────────────
@@ -63,13 +62,13 @@ def test_hypernetwork_output_shape():
     assert out.shape == ()
 
 
-def test_hypernetwork_batched_via_vmap():
+def test_hypernetwork_output_is_non_negative():
+    """Output is sqrt(...) so must be ≥ 0."""
     model = make_hypernetwork(KEY)
-    B = 8
-    c_encs = jax.random.normal(KEY, (B, D))
+    c_encs = jax.random.normal(KEY, (32, D))
     x = _x_samples(1)[0]
     outs = jax.vmap(model, in_axes=(0, None))(c_encs, x)
-    assert outs.shape == (B,)
+    assert jnp.all(outs >= 0.0)
 
 
 def test_hypernetwork_output_is_finite():
@@ -78,6 +77,15 @@ def test_hypernetwork_output_is_finite():
     x = _x_samples(1)[0]
     outs = jax.vmap(model, in_axes=(0, None))(c_encs, x)
     assert jnp.all(jnp.isfinite(outs))
+
+
+def test_hypernetwork_batched_via_vmap():
+    model = make_hypernetwork(KEY)
+    B = 8
+    c_encs = jax.random.normal(KEY, (B, D))
+    x = _x_samples(1)[0]
+    outs = jax.vmap(model, in_axes=(0, None))(c_encs, x)
+    assert outs.shape == (B,)
 
 
 def test_different_x_produce_different_outputs():
@@ -92,22 +100,20 @@ def test_different_x_produce_different_outputs():
 # ── gradient flow ─────────────────────────────────────────────────────────────
 
 
-def test_gradients_reach_stim_ffn():
-    """Full-model grad must reach stimulus_to_coord_params."""
+def test_gradients_reach_stimulus_ffn():
     model = make_hypernetwork(KEY)
     c_enc = encode(jnp.array(0.3), jnp.array(-0.4))
     x = _x_samples(1)[0]
     target = jnp.array(0.5)
 
     grads = eqx.filter_grad(lambda m: (m(c_enc, x) - target) ** 2)(model)
-    assert jnp.any(grads.stimulus_to_coord_params.layers[0].weight != 0.0)
+    assert jnp.any(grads.stimulus_ffn.layers[0].weight != 0.0)
 
 
 # ── diversity metric ──────────────────────────────────────────────────────────
 
 
 def test_diversity_metrics_at_init():
-    """At init the model should show non-zero parameter and functional diversity."""
     model = make_hypernetwork(KEY)
     c_encs = jax.random.normal(KEY, (16, D))
     xs = _x_samples(32)
@@ -116,6 +122,20 @@ def test_diversity_metrics_at_init():
     assert div["param_std"] > 0.0, "no parameter diversity at init"
     assert div["pred_std"] > 0.0, "no functional diversity at init"
     assert div["pred_range"] > 0.0
+
+
+# ── n_trainable_params ────────────────────────────────────────────────────────
+
+
+def test_n_trainable_params():
+    model = make_hypernetwork(KEY)
+    n = n_trainable_params(model)
+    assert n > 0
+    # All params are trainable (no frozen embeddings)
+    total = sum(
+        x.size for x in jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
+    )
+    assert n == total
 
 
 # ── integration ───────────────────────────────────────────────────────────────
@@ -132,19 +152,8 @@ def test_loss_is_finite_at_init():
     assert jnp.isfinite(loss)
 
 
-def test_n_trainable_params():
-    model = make_hypernetwork(KEY)
-    n = n_trainable_params(model)
-    assert n > 0
-    total = sum(
-        x.size for x in jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
-    )
-    assert n < total  # frozen param_embeddings excluded
-
-
-def test_step_updates_stim_ffn():
-    """A training step must change stim_ffn weights."""
-    import optax
+def test_step_updates_stimulus_ffn():
+    """A training step must change stimulus_ffn weights."""
     from god.training.hnn import _task_loss, HNNConfig
 
     cfg = HNNConfig(n_train=32, num_steps=5, seed=1)
@@ -154,7 +163,7 @@ def test_step_updates_stim_ffn():
     model = make_hypernetwork(k_model)
     ds = make_mandelbrot_dataset(cfg.n_train, 8, cfg.num_steps, k_data)
     c_train, t_train = ds.train_inputs, ds.train_targets
-    w_before = model.stimulus_to_coord_params.layers[0].weight.copy()
+    w_before = model.stimulus_ffn.layers[0].weight.copy()
 
     opt = optax.adamw(learning_rate=1e-3)
     opt_state = opt.init(eqx.filter(model, eqx.is_array))
@@ -169,4 +178,4 @@ def test_step_updates_stim_ffn():
 
     xs = _x_samples(cfg.n_mc_train, k_noise)
     model, _ = do_step(model, opt_state, c_train[:8], t_train[:8], xs)
-    assert not jnp.all(model.stimulus_to_coord_params.layers[0].weight == w_before)
+    assert not jnp.all(model.stimulus_ffn.layers[0].weight == w_before)

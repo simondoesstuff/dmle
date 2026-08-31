@@ -1,13 +1,14 @@
 """Recurrent Mandelbrot approximator.
 
-RNNCell: depth-parameterised tanh FFN.
-  depth=1 → Linear(2d→d) → tanh  (hidden_dim unused)
-  depth=N → [2d→h→…→h→d], all tanh
+RNNCell: TanhFFN-style cell — depth hidden tanh layers, then one linear output layer.
+  depth=0 → Linear(2d→d)               (purely linear)
+  depth=1 → Linear(2d→h) → tanh → Linear(h→d)
+  depth=N → [2d→h→…→h (N tanh layers) →d]
 
 MandelbrotRNN: applies the cell num_steps times with fixed input c, then
 reads out a predicted magnitude via one of two heads:
-  linear_head=False  →  h_T[0]*SCALE, h_T[1]*SCALE  (fixed-index projection)
-  linear_head=True   →  Linear(enc_dim→2) applied to h_T  (learned projection)
+  head=None   →  h_T[0]*SCALE, h_T[1]*SCALE  (fixed-index projection)
+  head=Linear →  Linear(enc_dim→2) applied to h_T  (learned projection)
 """
 
 import jax
@@ -19,9 +20,13 @@ from god.datasets.mandelbrot import SCALE, EPS
 
 
 class RNNCell(eqx.Module):
-    """(h_t, x) -> h_{t+1} via an N-layer tanh FFN."""
+    """(h_t, x) -> h_{t+1} via a TanhFFN-style cell.
+
+    depth=N: N hidden tanh layers then one linear output layer.
+    """
 
     layers: list[eqx.nn.Linear]
+    depth: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -31,14 +36,12 @@ class RNNCell(eqx.Module):
         key: PRNGKeyArray,
     ) -> None:
         super().__init__()
-        keys = jax.random.split(key, depth)
-        if depth == 1:
-            dims = [2 * enc_dim, enc_dim]
-        else:
-            dims = [2 * enc_dim] + [hidden_dim] * (depth - 1) + [enc_dim]
+        self.depth = depth
+        dims = [2 * enc_dim] + [hidden_dim] * depth + [enc_dim]
+        keys = jax.random.split(key, len(dims) - 1)
         self.layers = [
             eqx.nn.Linear(dims[i], dims[i + 1], key=keys[i])
-            for i in range(depth)
+            for i in range(len(dims) - 1)
         ]
 
     def __call__(
@@ -47,9 +50,9 @@ class RNNCell(eqx.Module):
         x: Float[Array, "d"],
     ) -> Float[Array, "d"]:
         h = jnp.concatenate([h_t, x])
-        for layer in self.layers:
+        for layer in self.layers[:-1]:
             h = jnp.tanh(layer(h))
-        return h
+        return self.layers[-1](h)
 
 
 class MandelbrotRNN(eqx.Module):

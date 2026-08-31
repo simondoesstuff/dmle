@@ -34,9 +34,9 @@ Higher frequency bands provide finer phase resolution for small |c| values; the 
 
 ### RNN cell
 
-A 2-layer tanh FFN:
+A depth=1 TanhFFN-style cell (one hidden tanh layer, linear output):
 ```
-(h_t, x) -> concat -> Linear(2d, hidden) -> tanh -> Linear(hidden, d) -> tanh -> h_{t+1}
+(h_t, x) -> concat -> Linear(2d, hidden) -> tanh -> Linear(hidden, d) -> h_{t+1}
 ```
 
 x = encode(c) is fixed across all T steps; h_0 = x.
@@ -47,10 +47,10 @@ x = encode(c) is fixed across all T steps; h_0 = x.
 h_0 = encode(c)
 for t in 1..T:
     h_t = cell(h_{t-1}, h_0)
-output: |decode(h_T)|
+output: |h_T[0..1]| in Mandelbrot scale
 ```
 
-Default: hidden_dim=128, T=50.
+Default: hidden_dim=16, depth=1, T=10.
 
 ## Training
 

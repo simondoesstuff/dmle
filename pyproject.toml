@@ -23,6 +23,7 @@ dependencies = [
   "seaborn>=0.13.2",
   "statistics>=1.0.3.5",
   "tqdm>=4.70.0",
+  "umap-learn>=0.5.7",
 ]
 
 [project.scripts]
@@ -31,6 +32,7 @@ god-mlp-grokk = "god.training.mlp:main_grokk"
 god-pcn = "god.training.pcn:main"
 god-hnn = "god.training.hnn:main"
 god-ffn-step = "god.training.ffn_step:main"
+god-hnn-umap = "god.analysis.hnn_umap:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

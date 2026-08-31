@@ -7,7 +7,7 @@ from god.models.rnn import RNNCell, MandelbrotRNN
 
 ENC_DIM = enc_dim(K_DEFAULT)
 HIDDEN = 32
-DEPTH = 2
+DEPTH = 1  # 1 hidden tanh layer + linear output
 NUM_STEPS = 5
 KEY = jax.random.PRNGKey(0)
 
@@ -20,27 +20,39 @@ def test_rnn_cell_output_shape():
     assert out.shape == (ENC_DIM,)
 
 
-def test_rnn_cell_depth1_no_hidden():
-    cell = RNNCell(ENC_DIM, hidden_dim=999, depth=1, key=KEY)
+def test_rnn_cell_depth0_single_linear():
+    """depth=0: single linear layer, no hidden."""
+    cell = RNNCell(ENC_DIM, hidden_dim=999, depth=0, key=KEY)
     assert len(cell.layers) == 1
     assert cell.layers[0].in_features == 2 * ENC_DIM
     assert cell.layers[0].out_features == ENC_DIM
 
 
-def test_rnn_cell_depth3():
-    cell = RNNCell(ENC_DIM, HIDDEN, depth=3, key=KEY)
+def test_rnn_cell_depth1_one_hidden():
+    """depth=1: one tanh hidden layer then linear output = 2 layers total."""
+    cell = RNNCell(ENC_DIM, HIDDEN, depth=1, key=KEY)
+    assert len(cell.layers) == 2
+    assert cell.layers[0].in_features == 2 * ENC_DIM
+    assert cell.layers[0].out_features == HIDDEN
+    assert cell.layers[1].in_features == HIDDEN
+    assert cell.layers[1].out_features == ENC_DIM
+
+
+def test_rnn_cell_depth2():
+    """depth=2: two tanh hidden layers + linear output = 3 layers total."""
+    cell = RNNCell(ENC_DIM, HIDDEN, depth=2, key=KEY)
     assert len(cell.layers) == 3
     assert cell.layers[0].in_features == 2 * ENC_DIM
     assert cell.layers[1].in_features == HIDDEN
     assert cell.layers[2].out_features == ENC_DIM
 
 
-def test_rnn_cell_output_in_tanh_range():
+def test_rnn_cell_output_is_finite():
     cell = RNNCell(ENC_DIM, HIDDEN, DEPTH, KEY)
     h = jnp.ones(ENC_DIM) * 0.5
     x = jnp.ones(ENC_DIM) * -0.3
     out = cell(h, x)
-    assert jnp.all(out >= -1.0) and jnp.all(out <= 1.0)
+    assert jnp.all(jnp.isfinite(out))
 
 
 def test_mandelbrot_rnn_output_shape():
