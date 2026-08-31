@@ -77,7 +77,7 @@ class HNNConfig:
 # ── checkpoint helpers ────────────────────────────────────────────────────────
 
 def _ckpt_tag(step: int) -> str:
-    return f"step_{step:05d}"
+    return f"step_{step:06d}"
 
 
 def _make_model_template(cfg: HNNConfig, key: jax.Array | None = None) -> HyperNetwork:

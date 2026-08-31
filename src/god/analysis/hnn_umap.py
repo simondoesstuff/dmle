@@ -27,9 +27,9 @@ from god.datasets.mandelbrot import make_mandelbrot_dataset
 from god.training.hnn import HNNConfig, _make_model_template
 
 
-def _find_checkpoint_steps(ckpt_dir: Path) -> list[int]:
+def _find_checkpoints(ckpt_dir: Path) -> list[tuple[int, Path]]:
     return sorted(
-        int(p.stem.split("_")[1])
+        (int(p.stem.split("_")[1]), p)
         for p in ckpt_dir.glob("step_*.eqx")
         if "_opt" not in p.name
     )
@@ -76,7 +76,9 @@ def run(
     out_dir: Path,
 ) -> None:
     ckpt_dir = data_dir / "checkpoints"
-    all_steps = _find_checkpoint_steps(ckpt_dir)
+    all_ckpts = _find_checkpoints(ckpt_dir)
+    all_steps = [s for s, _ in all_ckpts]
+    ckpt_map = {s: p for s, p in all_ckpts}
 
     step_set = set(all_steps)
     targets = np.linspace(all_steps[0], all_steps[-1], n_ckpts)
@@ -105,8 +107,7 @@ def run(
     reducer = UMAP(n_components=2, n_neighbors=min(15, n_networks - 1), random_state=0, verbose=False)
 
     for step in tqdm(sampled_steps, desc="checkpoints"):
-        tag = f"step_{step:05d}"
-        model = eqx.tree_deserialise_leaves(str(ckpt_dir / f"{tag}.eqx"), model_template)
+        model = eqx.tree_deserialise_leaves(str(ckpt_map[step]), model_template)
 
         k_stim, subkey = jax.random.split(k_stim)
         x_samples = jax.random.uniform(subkey, (n_networks, cfg.n_stimulus), minval=-1.0, maxval=1.0)
@@ -116,7 +117,7 @@ def run(
         log_losses = np.log(np.array(losses))
 
         embedding = reducer.fit_transform(param_vecs)
-        _plot_umap(embedding, log_losses, step, out_dir / f"step_{step:05d}.png")
+        _plot_umap(embedding, log_losses, step, out_dir / f"step_{step:06d}.png")
 
     print(f"\nSaved {len(sampled_steps)} plots → {out_dir}/")
 

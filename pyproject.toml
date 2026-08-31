@@ -33,6 +33,7 @@ god-pcn = "god.training.pcn:main"
 god-hnn = "god.training.hnn:main"
 god-ffn-step = "god.training.ffn_step:main"
 god-hnn-umap = "god.analysis.hnn_umap:main"
+god-hnn-sep = "god.analysis.hnn_separability:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
