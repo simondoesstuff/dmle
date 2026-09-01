@@ -152,6 +152,71 @@ def test_loss_is_finite_at_init():
     assert jnp.isfinite(loss)
 
 
+# ── soft aggregate ────────────────────────────────────────────────────────────
+
+
+def test_soft_aggregate_limits():
+    """softmin→min and softmax→max as T→0; any alpha, T→∞ →mean."""
+    from god.training.hnn import _soft_aggregate
+
+    losses = jnp.array([0.1, 0.3, 0.5, 0.7])
+
+    assert jnp.isclose(_soft_aggregate(losses, temperature=1e-4, alpha=-1.0), jnp.min(losses), atol=1e-3)
+    assert jnp.isclose(_soft_aggregate(losses, temperature=1e-4, alpha=+1.0), jnp.max(losses), atol=1e-3)
+    # large T → approximately mean
+    assert jnp.isclose(_soft_aggregate(losses, temperature=1e3, alpha=-1.0), jnp.mean(losses), atol=1e-2)
+    assert jnp.isclose(_soft_aggregate(losses, temperature=1e3, alpha=+1.0), jnp.mean(losses), atol=1e-2)
+
+
+def test_soft_aggregate_gradients():
+    """Softmin gradient concentrates on smallest-loss sample; softmax on largest."""
+    from god.training.hnn import _soft_aggregate
+
+    losses = jnp.array([0.1, 0.5, 0.9])
+    # low temperature → near-hard selection
+    g_min = jax.grad(lambda l: _soft_aggregate(l, 0.01, -1.0))(losses)
+    g_max = jax.grad(lambda l: _soft_aggregate(l, 0.01, +1.0))(losses)
+    assert jnp.argmax(g_min) == 0   # min loss gets most gradient
+    assert jnp.argmax(g_max) == 2   # max loss gets most gradient
+
+
+def test_adaptive_temp():
+    """_adaptive_temp scales with std of losses and floors at 1e-8."""
+    from god.training.hnn import _adaptive_temp
+
+    losses = jnp.array([0.1, 0.2, 0.3, 0.4])
+    T = _adaptive_temp(losses, scale=1.0)
+    assert jnp.isclose(T, jnp.std(losses), rtol=1e-5)
+
+    # floor kicks in when losses are identical
+    flat = jnp.ones(4) * 0.5
+    T_flat = _adaptive_temp(flat, scale=1.0)
+    assert float(T_flat) > 0.0
+
+
+def test_soft_weights_sum_to_one():
+    from god.training.hnn import _soft_weights
+
+    losses = jnp.array([0.2, 0.4, 0.6])
+    for alpha in [-1.0, +1.0]:
+        w = _soft_weights(losses, temperature=0.05, alpha=alpha)
+        assert jnp.isclose(jnp.sum(w), 1.0)
+        assert jnp.all(w >= 0.0)
+
+
+def test_task_loss_softmax_vs_softmin():
+    """Softmax loss ≥ softmin loss for the same batch (max ≥ min)."""
+    from god.training.hnn import _task_loss
+
+    model = make_hypernetwork(KEY)
+    k1, k2 = jax.random.split(KEY)
+    ds = make_mandelbrot_dataset(32, 8, 5, k1)
+    x_samples = _x_samples(8, k2)
+    loss_min = _task_loss(model, ds.train_inputs, ds.train_targets, x_samples, alpha=-1.0, temp_scale=1.0)
+    loss_max = _task_loss(model, ds.train_inputs, ds.train_targets, x_samples, alpha=+1.0, temp_scale=1.0)
+    assert float(loss_max) >= float(loss_min)
+
+
 def test_step_updates_stimulus_ffn():
     """A training step must change stimulus_ffn weights."""
     from god.training.hnn import _task_loss, HNNConfig
