@@ -37,6 +37,8 @@ god-hnn-sep = "god.analysis.hnn_separability:main"
 god-grokking = "god.training.grokking:main"
 god-grokking-long = "god.training.grokking:main_long"
 god-grokking-cont = "god.training.grokking:main_cont"
+god-grokking-hnn = "god.training.grokking_hnn:main"
+god-grokking-hnn-cont = "god.training.grokking_hnn:main_cont"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

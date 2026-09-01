@@ -36,15 +36,15 @@ class TrainConfig:
 
     # Data
     modulus: int = 97
-    train_fraction: float = 0.3
+    train_fraction: float = 0.5
 
     # Training — full-batch AdamW; weight_decay is the critical knob
-    n_epochs: int = 50_000
+    n_epochs: int = 200_000
     lr: float = 1e-3
     weight_decay: float = 1.0
 
     # Record accuracy/loss every log_interval epochs
-    log_interval: int = 50
+    log_interval: int = 2000
 
     # Reproducibility
     seed: int = 0
@@ -164,7 +164,9 @@ def train(cfg: TrainConfig) -> TanhFFN:
 
     dataset, model, in_dim = _load_dataset_and_template(cfg)
 
-    n_params = sum(x.size for x in jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array)))
+    n_params = sum(
+        x.size for x in jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
+    )
     print(
         f"Model: in={in_dim}, hidden={cfg.hidden_dim}×{cfg.depth}, "
         f"out={cfg.modulus}, params={n_params:,}"
@@ -178,8 +180,14 @@ def train(cfg: TrainConfig) -> TanhFFN:
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
     model, metrics = _run_loop(
-        model, optimizer, opt_state, dataset, cfg,
-        n_epochs=cfg.n_epochs, start_epoch=0, existing_metrics=[],
+        model,
+        optimizer,
+        opt_state,
+        dataset,
+        cfg,
+        n_epochs=cfg.n_epochs,
+        start_epoch=0,
+        existing_metrics=[],
     )
 
     (data_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
@@ -204,9 +212,7 @@ def continue_train(cfg: TrainConfig, additional_epochs: int) -> TanhFFN:
     metrics_path = data_dir / "metrics.json"
 
     if not model_path.exists():
-        raise FileNotFoundError(
-            f"No checkpoint at {model_path}. Run train() first."
-        )
+        raise FileNotFoundError(f"No checkpoint at {model_path}. Run train() first.")
 
     dataset, template, in_dim = _load_dataset_and_template(cfg)
     model = eqx.tree_deserialise_leaves(str(model_path), template)
@@ -219,8 +225,13 @@ def continue_train(cfg: TrainConfig, additional_epochs: int) -> TanhFFN:
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
     model, metrics = _run_loop(
-        model, optimizer, opt_state, dataset, cfg,
-        n_epochs=additional_epochs, start_epoch=start_epoch,
+        model,
+        optimizer,
+        opt_state,
+        dataset,
+        cfg,
+        n_epochs=additional_epochs,
+        start_epoch=start_epoch,
         existing_metrics=existing_metrics,
     )
 
