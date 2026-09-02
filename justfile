@@ -24,3 +24,6 @@ test *args:
 alias i := install
 install:
 	uv sync
+
+hnn-best:
+	uv run scripts/hnn_best_run.py

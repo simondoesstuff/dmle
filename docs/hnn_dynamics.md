@@ -110,12 +110,14 @@ target networks → test≈0%.
 | Low wd_hnn + lambda_td | yes (pstd→0) | no | effective target wd is wd_hnn=0.01, 50× too weak |
 | High wd_hnn, fresh x | no (pstd~0.018) | no | HNN memorises per-x; eval x are unseen |
 | High wd_hnn, fixed x | TBD | TBD | pure reparameterisation; expected to reproduce FFN |
+| wd_output_layer=0.5, fresh x | yes (pstd→0) | no | output layer shrinkage reaches equilibrium at norm~504 (Adam balances shrinkage) |
+| wd_output_layer=2.0, fresh x | yes (pstd→0) | weak (test→1.4%) | equilibrium norm ~291, below generalising threshold |
+| wd_output_layer=4.0, fresh x | yes (pstd→0) | **yes** ✓ | equilibrium norm ~193, matches Fourier solution; grokking at epoch ~26k |
 
 **Key insight**: the stimulus collapse and the correct regularisation strength are in
-tension when using random x:
-- Collapse requires `wd_hnn` small relative to gradient signal
-- Correct effective target wd requires `wd_hnn ≈ 0.5`
-- These cannot both be satisfied simultaneously with random fresh x
+tension when using random x AND standard HNN weight decay. Post-step multiplicative
+shrinkage on the output layer bypasses Adam and acts as true WD on the generated target
+params — but requires ~8× the direct FFN WD to compensate for effective lr amplification.
 
 ---
 
@@ -197,26 +199,109 @@ but that defeats the purpose of the HNN.
 
 ---
 
+## HNN Experiment 6 — Post-Step Output Layer Shrinkage Sweep
+
+Post-step multiplicative shrinkage applied to `stimulus_ffn.layers[-1]` (weight + bias)
+each step: `W_last *= (1 - wd_output_layer * lr)`. This bypasses Adam and acts as
+true AdamW WD on the generated target params via the output layer.
+
+`weight_decay=0.0, grad_clip=1.0, n_mc=1, frac=0.3, fixed_x=False`
+
+| wd_output_layer | epoch@mem | test@mem | peak test | norm@eq | grokking? |
+|-----------------|-----------|----------|-----------|---------|-----------|
+| 0.5 | ~10k | 0.2% | 0.2% | 504 | no |
+| 2.0 | ~10k | 0.2% | 1.4% | 291 | very weak |
+| 4.0 | ~8k | 7.8% | **96%** ✓ | 193 | **yes** |
+
+**wd_output_layer=4.0 grokking timeline**:
+
+| epoch | train | test | param_norm |
+|-------|-------|------|------------|
+| 1 | 1.1% | 1.0% | 2.8 |
+| 8k | 100% | 7.8% | 171 |
+| 12k | 100% | 35.3% | 169 |
+| 16k | 100% | 69.0% | 166 |
+| 22k | 100% | 90.8% | 172 |
+| 26k | 100% | 93.8% | 172 |
+| 60k | 100% | 95.3% | 195 |
+| 100k | 100% | 96.2% | 194 |
+
+**Key observation**: `param_norm` settles at ~193–195 — the same equilibrium the direct
+FFN occupies after grokking with `wd=0.5`. The model memorises at norm ~170, which is
+*below* the equilibrium. It then slowly climbs to equilibrium (~195) as generalisation
+kicks in. The norm does not decay post-memorisation; instead generalisation occurs while
+the model finds the Fourier solution at the fixed equilibrium norm.
+
+**Why 4.0 (not 0.5)?** The effective lr amplification from gradient pathways
+(W0, W1, b_last) pushes target params roughly 4–8× harder than wd_output_layer alone
+assumes. `wd_output_layer=4.0` sets the Adam-equilibrium norm at ~193, which is where
+the Fourier/generalising solution lives. Lower values (0.5, 2.0) settle at higher norms
+where the memorising attractor is stable.
+
+---
+
+## FFN LR Scaling Ablation — Is the HNN Just a High-LR FFN?
+
+To test whether the HNN's speed advantage is simply an effective LR increase,
+we ran the direct FFN (hidden=32, depth=1, frac=0.3) with scaled lr and wd.
+
+In AdamW, per-step weight shrinkage = `wd * lr`. Scaling both by 4× gives 16×
+stronger shrinkage — over-regularised. The correct equivalent-speed comparison
+is `lr=4e-3, wd=0.5` (4× LR, same WD, preserving the WD/update ratio).
+
+| config | mem@ | peak test | notes |
+|--------|------|-----------|-------|
+| FFN lr=1e-3 wd=0.5 (baseline) | 30k | 94.2% @96k | two-phase grokking |
+| FFN lr=4e-3 wd=0.5 | 12k | 90.9% @34k | ~2.5–2.8× faster, noisy generalisation |
+| FFN lr=4e-3 wd=2.0 (4× both) | never | 0.9% | 16× shrinkage prevents memorisation |
+| HNN wd_output_layer=4.0 | 8k | **96.2%** @84k | 3.5× faster, higher accuracy |
+
+**The HNN is not just a high-LR FFN.** 4× LR on the direct FFN does recover speed
+(~2.8× faster) but trades off accuracy (90.9% vs 94.2%) and stability — the
+generalisation curve is noisy and the peak is not sustained. The HNN is faster still
+(3.5× vs baseline) and achieves *higher* final accuracy than even the baseline FFN.
+
+**Why?** The HNN's per-target-param gradient amplification comes from multiple
+structurally independent pathways (W0 rows, W1 columns, b_last) each contributing
+±lr to a different "dimension" of the target param update. This is qualitatively
+different from a uniform LR scale: it produces correlated, multi-direction pressure
+on each param simultaneously, which appears to find the Fourier attractor more
+reliably than a scalar LR increase with noisier per-step updates.
+
+This is a baseline HNN with the simplest possible stimulus FFN (8→8→9473, tanh).
+The grokking improvement over the direct FFN is already non-trivial.
+
+---
+
 ## Implications and Open Questions
 
-1. **The HNN cannot reproduce FFN grokking via simple hyperparameter adjustment.**
-   The effective lr amplification from the indirect parameterisation is structural.
-   Increasing `wd_hnn` to compensate only prevents collapse or causes other failure
-   modes (per-x overfitting).
+1. **HNN grokking IS achievable with random x** by applying post-step multiplicative
+   shrinkage to the output layer with `wd_output_layer ≈ 4–8× the direct FFN wd`.
+   The effective lr amplification (from gradient pathways W0, W1, b_last) requires
+   this compensation. This is a structural property — every hidden layer adds more
+   gradient pathways.
 
-2. **What would it take for the HNN to grok with random x?** The grokking mechanism
-   requires slow memorisation under regularisation pressure. With random x and effective
-   lr amplification, the HNN memorises too fast to accumulate the weight-norm pressure
-   needed to find the compact Fourier solution. A training procedure that explicitly
-   controls memorisation speed (e.g., learning rate warmup, curriculum on wd, or
-   direct control of target param norms) may be needed.
+2. **The collapse is a feature, not a bug.** `param_std → 0` within 30k epochs for
+   all random-x runs. After collapse, the HNN effectively generates a single target
+   network for all x. The post-step shrinkage on the output layer then acts as true
+   WD on that single target network, enabling the grokking ratchet.
 
-3. **The collapse is confirmed but insufficient.** Weight decay does collapse the HNN
-   to a constant target network (param_std → 0 quickly). But after collapse, the
-   effective target regularisation from wd_hnn is still subject to the lr amplification
-   issue, so grokking doesn't follow.
+3. **The HNN has a genuine architectural advantage over a scaled-LR FFN.** The
+   multi-pathway gradient structure produces more stable convergence to the Fourier
+   solution than a global LR increase. This suggests the reparameterisation geometry
+   — not just effective lr — is doing useful work.
 
-4. **The random-x HNN shows distinct dynamics worth studying.** The partial
-   generalisation at memorisation time (test=10–35% before any grokking phase) and the
-   flat plateau suggest the HNN settles into a qualitatively different attractor than
-   the direct FFN's memorising solution. This may be interesting in its own right.
+4. **Open: does x-diversity matter post-grokking?** Since collapse makes the HNN
+   equivalent to a single target FFN, the x-stimulus plays no role in the generalised
+   solution. A truly x-dependent grokking would require preventing collapse — which
+   requires strong WD on the hidden layers, which blocks cross-x consolidation (Exp 3).
+
+5. **Open: deeper stimulus FFN.** Every hidden layer adds another 8× of gradient
+   pathways. A stim_depth=2 stimulus FFN would have ~72× effective lr amplification,
+   requiring `wd_output_layer ≈ 36`. Does convergence continue to improve, or does
+   the amplification become destabilising?
+
+6. **Open: x-dependent grokking.** Can the stimulus x play a meaningful role in the
+   generalised solution? Preventing collapse while maintaining cross-x generalisation
+   is the key challenge — a fundamentally different regularisation scheme would be
+   needed (e.g., explicit diversity loss, or a non-collapsed target ensemble).

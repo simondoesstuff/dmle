@@ -2,21 +2,27 @@
 
 Applies a HyperNetwork (HNN) to (a+b) mod 97 to establish a grokking baseline.
 The stimulus FFN maps noise x ~ U[-1,1]^n_stimulus to the weights of a small
-target FFN classifier. n_mc noise vectors are sampled each step; the mean
-cross-entropy over them is the training loss.
+target FFN classifier. n_mc noise vectors are sampled each step; the loss is the
+**softmax-weighted sum of per-x cross-entropy** (focuses gradient on the
+worst-performing x) plus a **softmin-weighted sum of per-x target complexity**
+(focuses gradient on the simplest target network).
 
-With strong weight decay (weight_decay~1.0), the HNN's generated target
-parameters are regularised indirectly, which is expected to produce a grokking
-curve similar to the plain-FFN baseline — memorisation then delayed
-generalisation.
+Both weighting schemes standardise their inputs per-batch before the softmax so
+that the temperature parameter `softmax_temp` / `softmin_temp` is scale-free and
+behaves consistently regardless of how large the norms or CE values are.
 
-Key knobs for adjusting grokking speed:
-  weight_decay      — higher → slower memorisation, faster grok onset
-  lambda_target_decay — direct L2 on generated params (augments weight_decay)
-  train_fraction    — lower → slower grok (less signal for generalisation)
-  target_hidden     — larger → more capacity, longer grok
-  n_mc              — set to 1 for a single fixed-x run (pure reparameterisation
-                       baseline); larger values average over x diversity
+With lambda_complexity > 0 the optimizer balances:
+  - minimising the worst-case error across x samples
+  - shrinking the best-case target network complexity
+This decouples error and complexity optimisation without explicit WD on the HNN
+or any post-step shrinkage — `lambda_complexity` is the primary grokking knob.
+
+Key knobs:
+  lambda_complexity  — weight for softmin complexity term (replaces wd_output_layer)
+  softmax_temp       — sharpness of error weighting (→0 = hard worst-x focus)
+  softmin_temp       — sharpness of complexity weighting (→0 = hard min-complexity)
+  train_fraction     — lower → slower grok (less signal for generalisation)
+  target_hidden      — larger → more capacity, longer grok
 
 Entry points:
   god-grokking-hnn       — 200k epochs (full grok)
@@ -58,23 +64,36 @@ class GrokkingHNNConfig:
     modulus: int = 97
     train_fraction: float = 0.5
 
-    # Training — full-batch AdamW
+    # Training — full-batch Adam + gradient clipping
     n_epochs: int = 200_000
     lr: float = 1e-3
-    weight_decay: float = 0.01  # low: HNN is relatively unconstrained
+    weight_decay: float = 0.0   # no WD on HNN; stability comes from grad clipping
+    grad_clip: float = 1.0      # global norm clip
 
-    # L2 on generated target params — this is the primary grokking knob,
-    # analogous to weight_decay on the standalone FFN baseline
-    lambda_target_decay: float = 1.0
+    # Decoupled complexity regularisation
+    # Loss = softmax_error(x) + lambda_complexity * softmin_complexity(x)
+    # lambda_complexity is the primary grokking knob (replaces wd_output_layer)
+    lambda_complexity: float = 1e-2
+    softmax_temp: float = 1.0   # error weighting sharpness
+    softmin_temp: float = 1.0   # complexity weighting sharpness
 
-    # MC noise samples per step
+    # Legacy: L2 on generated target params (loss term)
+    lambda_target_decay: float = 0.0
+
+    # MC noise samples per step — drives the per-x diversity
     n_mc: int = 4
-    # If True, sample x once at init and reuse every step (pure reparameterisation
-    # baseline: HNN becomes equivalent to a directly-trained target FFN)
+    # If True, sample x once at init and reuse every step
     fixed_x: bool = False
 
-    # Log accuracy/loss every log_interval epochs
+    # Logging
     log_interval: int = 2000
+    hexplot_interval: int = 20_000   # 0 = disabled
+    checkpoint_interval: int = 0     # 0 = disabled; saves checkpoint_{epoch:07d}.eqx
+    # Fixed axis ranges so all hexplots in a run are directly comparable.
+    # Complexity axis: set to cover the expected Fourier-solution norm (~193).
+    # CE axis: log(97)≈4.6 is chance; 0 means auto (not recommended for sweeps).
+    hexplot_xlim: float = 1000.0
+    hexplot_ylim: float = 5.0
 
     # Reproducibility
     seed: int = 0
@@ -85,21 +104,44 @@ def _loss_and_metrics(
     inputs: jax.Array,
     targets: jax.Array,
     x_samples: jax.Array,
-    lambda_target_decay: float,
+    lambda_target_decay: float = 0.0,
+    lambda_complexity: float = 0.0,
+    softmax_temp: float = 1.0,
+    softmin_temp: float = 1.0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Returns (loss, mean_accuracy, mean_ce_loss) averaged over MC samples."""
+    """Returns (loss, mean_accuracy, mean_ce_loss).
 
-    def per_x(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    Loss = softmax_weighted(CE) + lambda_complexity * softmin_weighted(norm)
+
+    Softmax over per-x errors focuses gradient on the worst-performing x.
+    Softmin over per-x target norms rewards the simplest target network.
+    Inputs are z-scored per batch so temperature is scale-free throughout
+    training. stop_gradient is applied to the weights — without it the
+    softmax term would *increase* below-average errors.
+    """
+
+    def per_x(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
         logits = jax.vmap(model, in_axes=(0, None))(inputs, x)
         ce = jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, targets))
         acc = jnp.mean(jnp.argmax(logits, axis=-1) == targets)
-        return ce, acc
+        complexity = jnp.linalg.norm(model.target_params(x))
+        return ce, acc, complexity
 
-    ces, accs = jax.vmap(per_x)(x_samples)  # (n_mc,) each
+    ces, accs, complexities = jax.vmap(per_x)(x_samples)  # (n_mc,) each
     mean_ce = jnp.mean(ces)
     mean_acc = jnp.mean(accs)
 
-    loss = mean_ce
+    # Standardise per-batch so temperature is scale-free
+    ces_norm = (ces - ces.mean()) / (ces.std() + 1e-6)
+    err_w = jax.lax.stop_gradient(jax.nn.softmax(ces_norm / softmax_temp))
+    weighted_error = jnp.dot(err_w, ces)
+
+    cpx_norm = (complexities - complexities.mean()) / (complexities.std() + 1e-6)
+    cpx_w = jax.lax.stop_gradient(jax.nn.softmax(-cpx_norm / softmin_temp))
+    weighted_complexity = jnp.dot(cpx_w, complexities)
+
+    loss = weighted_error + lambda_complexity * weighted_complexity
+
     if lambda_target_decay > 0.0:
         l2 = jnp.mean(jax.vmap(lambda x: jnp.mean(model.target_params(x) ** 2))(x_samples))
         loss = loss + lambda_target_decay * l2
@@ -161,6 +203,68 @@ def _plot(metrics: list[dict[str, Any]], out_path: Path) -> None:
     plt.close(fig)
 
 
+def _hexplot(
+    model: ModularHNN,
+    dataset: Any,
+    n_stimulus: int,
+    epoch: int,
+    out_dir: Path,
+    n_samples: int = 500,
+    xlim: float = 1000.0,
+    ylim: float = 5.0,
+) -> None:
+    """Hexbin of (target complexity, train CE) over random x samples.
+
+    Complexity axis is log-scaled so init (pnorm~3) and grokking (~193) and
+    collapsed-WD (~500+) regimes are all visible in the same plot.
+    xlim/ylim are fixed across all calls so hexplots in a run are comparable.
+    """
+    import matplotlib.pyplot as plt
+
+    key = jax.random.PRNGKey(epoch)
+    x_samples = jax.random.uniform(key, (n_samples, n_stimulus), minval=-1.0, maxval=1.0)
+
+    @eqx.filter_jit
+    def _batch_metrics(xs: jax.Array) -> tuple[jax.Array, jax.Array]:
+        def per_x(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+            logits = jax.vmap(model, in_axes=(0, None))(dataset.train_inputs, x)
+            ce = jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, dataset.train_targets))
+            complexity = jnp.linalg.norm(model.target_params(x))
+            return ce, complexity
+        return jax.vmap(per_x)(xs)
+
+    errors, complexities = _batch_metrics(x_samples)
+    errors = np.array(errors)
+    complexities = np.array(complexities)
+
+    # Log-transform complexity for equal-width bins in log space
+    log_cpx = np.log10(np.maximum(complexities, 0.1))
+    x_min, x_max = np.log10(0.1), np.log10(xlim)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    hb = ax.hexbin(
+        log_cpx, errors,
+        gridsize=25, cmap="plasma", mincnt=1,
+        extent=[x_min, x_max, 0, ylim],
+    )
+    plt.colorbar(hb, ax=ax, label="count")
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(0, ylim)
+
+    # Label ticks with actual complexity values
+    tick_vals = [v for v in [0.1, 1, 3, 10, 30, 100, 200, 500, 1000] if v <= xlim]
+    ax.set_xticks([np.log10(v) for v in tick_vals])
+    ax.set_xticklabels([str(int(v)) if v >= 1 else str(v) for v in tick_vals])
+
+    ax.set_xlabel("target complexity (L2 norm, log scale)")
+    ax.set_ylabel("train CE")
+    ax.set_title(f"Error vs Complexity — epoch {epoch:,}")
+    fig.tight_layout()
+    out_path = out_dir / f"hexplot_{epoch:07d}.png"
+    fig.savefig(str(out_path), dpi=130)
+    plt.close(fig)
+
+
 def _run_loop(
     model: ModularHNN,
     optimizer: optax.GradientTransformation,
@@ -171,6 +275,7 @@ def _run_loop(
     start_epoch: int,
     existing_metrics: list[dict[str, Any]],
     rng: np.random.Generator,
+    data_dir: Path,
 ) -> tuple[ModularHNN, list[dict[str, Any]]]:
     key = jax.random.PRNGKey(cfg.seed + start_epoch)
 
@@ -183,7 +288,11 @@ def _run_loop(
         x_samples: jax.Array,
     ) -> tuple[ModularHNN, optax.OptState, jax.Array]:
         loss, grads = eqx.filter_value_and_grad(
-            lambda m: _loss_and_metrics(m, inputs, targets, x_samples, cfg.lambda_target_decay)[0]
+            lambda m: _loss_and_metrics(
+                m, inputs, targets, x_samples,
+                cfg.lambda_target_decay, cfg.lambda_complexity,
+                cfg.softmax_temp, cfg.softmin_temp,
+            )[0]
         )(model)
         updates, new_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
         return eqx.apply_updates(model, updates), new_state, loss
@@ -195,10 +304,9 @@ def _run_loop(
         targets: jax.Array,
         x_samples: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
-        _, acc, ce = _loss_and_metrics(model, inputs, targets, x_samples, 0.0)
+        _, acc, ce = _loss_and_metrics(model, inputs, targets, x_samples)
         return ce, acc
 
-    # Fixed x: sample once, reuse every step (pure reparameterisation baseline)
     if cfg.fixed_x:
         key, subkey = jax.random.split(key)
         _fixed_x_samples = jax.random.uniform(
@@ -220,10 +328,25 @@ def _run_loop(
             model, opt_state, dataset.train_inputs, dataset.train_targets, x_samples
         )
 
-        if (epoch + 1) % cfg.log_interval == 0 or (start_epoch == 0 and i == 0):
+        do_log = (epoch + 1) % cfg.log_interval == 0 or (start_epoch == 0 and i == 0)
+        do_hex = cfg.hexplot_interval > 0 and (
+            (epoch + 1) % cfg.hexplot_interval == 0 or (start_epoch == 0 and i == 0)
+        )
+        do_ckpt = cfg.checkpoint_interval > 0 and (
+            (epoch + 1) % cfg.checkpoint_interval == 0 or (start_epoch == 0 and i == 0)
+        )
+
+        if do_ckpt:
+            eqx.tree_serialise_leaves(
+                str(data_dir / f"checkpoint_{epoch + 1:07d}.eqx"), model
+            )
+
+        if do_hex:
+            _hexplot(model, dataset, cfg.n_stimulus, epoch + 1, data_dir,
+                     xlim=cfg.hexplot_xlim, ylim=cfg.hexplot_ylim)
+
+        if do_log:
             key, eval_key = jax.random.split(key)
-            # Fixed-x: evaluate only on the training x (otherwise most eval x
-            # produce untrained target networks, corrupting the accuracy signal)
             if cfg.fixed_x:
                 x_eval = _fixed_x_samples
             else:
@@ -236,7 +359,6 @@ def _run_loop(
             te_loss, te_acc = eval_metrics(
                 model, dataset.test_inputs, dataset.test_targets, x_eval
             )
-            # Per-x test accuracies to track diversity of generalisation
             per_x_te_acc = jax.vmap(
                 lambda x: jnp.mean(
                     jnp.argmax(jax.vmap(model, in_axes=(0, None))(dataset.test_inputs, x), axis=-1)
@@ -305,15 +427,19 @@ def train(cfg: GrokkingHNNConfig) -> ModularHNN:
         f"Data: {dataset.train_inputs.shape[0]} train / "
         f"{dataset.test_inputs.shape[0]} test  ({cfg.train_fraction:.0%} split)"
     )
-    print(f"n_mc={cfg.n_mc}, weight_decay={cfg.weight_decay}, lambda_target_decay={cfg.lambda_target_decay}")
+    print(f"n_mc={cfg.n_mc}, lambda_complexity={cfg.lambda_complexity}, weight_decay={cfg.weight_decay}, grad_clip={cfg.grad_clip}")
 
-    optimizer = optax.adamw(learning_rate=cfg.lr, weight_decay=cfg.weight_decay)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(cfg.grad_clip),
+        optax.adamw(learning_rate=cfg.lr, weight_decay=cfg.weight_decay),
+    )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
     rng = np.random.default_rng(cfg.seed)
 
     model, metrics = _run_loop(
         model, optimizer, opt_state, dataset, cfg,
         n_epochs=cfg.n_epochs, start_epoch=0, existing_metrics=[], rng=rng,
+        data_dir=data_dir,
     )
 
     (data_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
@@ -342,7 +468,10 @@ def continue_train(cfg: GrokkingHNNConfig, additional_epochs: int) -> ModularHNN
 
     print(f"Resuming from epoch {start_epoch}, running {additional_epochs} more")
 
-    optimizer = optax.adamw(learning_rate=cfg.lr, weight_decay=cfg.weight_decay)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(cfg.grad_clip),
+        optax.adamw(learning_rate=cfg.lr, weight_decay=cfg.weight_decay),
+    )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
     rng = np.random.default_rng(cfg.seed)
 
@@ -350,6 +479,7 @@ def continue_train(cfg: GrokkingHNNConfig, additional_epochs: int) -> ModularHNN
         model, optimizer, opt_state, dataset, cfg,
         n_epochs=additional_epochs, start_epoch=start_epoch,
         existing_metrics=existing_metrics, rng=rng,
+        data_dir=data_dir,
     )
 
     (data_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))

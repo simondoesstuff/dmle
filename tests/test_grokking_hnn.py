@@ -174,6 +174,7 @@ def test_train_smoke(tmp_path):
         n_epochs=20,
         log_interval=10,
         n_mc=2,
+        hexplot_interval=0,
         seed=0,
     )
     model = train(cfg)
