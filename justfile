@@ -27,3 +27,9 @@ install:
 
 hnn-best:
 	uv run scripts/hnn_best_run.py
+
+sync target="simon@layerlab":
+	rsync -avz --delete --prune-empty-dirs \
+		--exclude-from=<(git ls-files --ignored --exclude-standard --others --directory) \
+		--exclude=".git/" \
+		./ {{target}}:~/projects/dmle
