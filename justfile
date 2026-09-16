@@ -34,8 +34,13 @@ hnn-bias-ablation *args="":
 hnn-wd-sweep *args="":
 	uv run scripts/hnn_wd_sweep.py {{args}}
 
-sync target="simon@layerlab":
+push target="simon@layerlab":
 	rsync -avz --delete --prune-empty-dirs \
 		--exclude-from=<(git ls-files --ignored --exclude-standard --others --directory) \
 		--exclude=".git/" \
 		./ {{target}}:~/projects/dmle
+
+pull pattern target="simon@layerlab":
+	rsync -avz -m \
+		--include="*/" --include="{{pattern}}" --exclude="*" \
+		{{target}}:~/projects/dmle/ ./
