@@ -28,6 +28,12 @@ install:
 hnn-best:
 	uv run scripts/hnn_best_run.py
 
+hnn-bias-ablation *args="":
+	uv run scripts/hnn_bias_ablation.py {{args}}
+
+hnn-wd-sweep *args="":
+	uv run scripts/hnn_wd_sweep.py {{args}}
+
 sync target="simon@layerlab":
 	rsync -avz --delete --prune-empty-dirs \
 		--exclude-from=<(git ls-files --ignored --exclude-standard --others --directory) \

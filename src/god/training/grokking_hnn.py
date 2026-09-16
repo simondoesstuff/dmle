@@ -24,6 +24,19 @@ Key knobs:
   train_fraction     — lower → slower grok (less signal for generalisation)
   target_hidden      — larger → more capacity, longer grok
 
+Ablation knobs (see docs/hnn_dynamics.md):
+  output_bias        — False removes the stimulus FFN's final-layer bias, so
+                        every generated target param must flow through the
+                        x-dependent pathway (no free x-independent copy).
+  shrink_target/wd    — post-step multiplicative shrinkage on
+                        stimulus_ffn.layers[-1], bypassing Adam:
+                        "bias" (the x-independent copy), "weight" (the
+                        x-dependent carrier — required when output_bias=False),
+                        or "both" (reproduces the historical wd_output_layer).
+  probe_n/probe_seed  — fixed diagnostic x-probe set, independent of training
+                        x, for cross-run comparable param_std/bias/residual
+                        norm decomposition (logged as probe_* metrics).
+
 Entry points:
   god-grokking-hnn       — 200k epochs (full grok)
   god-grokking-hnn-cont  — continue from checkpoint
@@ -59,6 +72,7 @@ class GrokkingHNNConfig:
     stim_ffn_hidden: int = 8
     stim_ffn_depth: int = 1
     init_scale: float = 0.1
+    output_bias: bool = True  # False = no bias on stimulus_ffn's final layer
 
     # Data
     modulus: int = 97
@@ -80,10 +94,26 @@ class GrokkingHNNConfig:
     # Legacy: L2 on generated target params (loss term)
     lambda_target_decay: float = 0.0
 
+    # Post-step multiplicative shrinkage on stimulus_ffn.layers[-1], bypassing
+    # Adam (true AdamW-style WD applied directly to the chosen carrier of the
+    # generated target params). "bias" isolates the x-independent copy Adam
+    # tends to hide in; "weight" shrinks the x-dependent pathway (the only
+    # option when output_bias=False); "both" reproduces the historical
+    # wd_output_layer mechanism; "none" disables this (default).
+    shrink_target: str = "none"  # "none" | "bias" | "weight" | "both"
+    shrink_wd: float = 0.0
+
     # MC noise samples per step — drives the per-x diversity
     n_mc: int = 4
     # If True, sample x once at init and reuse every step
     fixed_x: bool = False
+
+    # Fixed diagnostic probe set of x — independent of training x and of
+    # `fixed_x`/`seed`, identical across runs for cross-run comparability.
+    # Used to decompose generated target params into bias vs x-dependent
+    # (residual) norm, and to measure true diversity even when fixed_x=True.
+    probe_n: int = 32
+    probe_seed: int = 12345
 
     # Logging
     log_interval: int = 2000
@@ -97,6 +127,14 @@ class GrokkingHNNConfig:
 
     # Reproducibility
     seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.shrink_target not in ("none", "bias", "weight", "both"):
+            raise ValueError(f"shrink_target must be none/bias/weight/both, got {self.shrink_target!r}")
+        if self.shrink_target in ("bias", "both") and not self.output_bias:
+            raise ValueError("shrink_target requires output_bias=True to shrink a bias that doesn't exist")
+        if self.shrink_target != "none" and self.shrink_wd <= 0.0:
+            raise ValueError(f"shrink_target={self.shrink_target!r} but shrink_wd={self.shrink_wd} (must be > 0)")
 
 
 def _loss_and_metrics(
@@ -159,6 +197,34 @@ def _param_norm(model: ModularHNN, x_samples: jax.Array) -> float:
     """Mean L2 norm of generated target params across x_samples."""
     all_params = jax.vmap(model.target_params)(x_samples)
     return float(jnp.mean(jnp.linalg.norm(all_params, axis=1)))
+
+
+def _probe_metrics(model: ModularHNN, probe_x: jax.Array) -> dict[str, float]:
+    """Diagnostics on a fixed probe x set (independent of training/fixed_x).
+
+    Decomposes generated target params into the x-independent bias component
+    and the x-dependent residual (target_params(x) - bias), so bias-vs-weight
+    shrinkage effects are directly comparable across arms with/without a bias.
+    """
+    all_params = jax.vmap(model.target_params)(probe_x)  # (probe_n, n_params)
+    total_norm = float(jnp.mean(jnp.linalg.norm(all_params, axis=1)))
+    total_std = float(jnp.mean(jnp.std(all_params, axis=0)))
+
+    bias = model.stimulus_ffn.layers[-1].bias
+    if bias is not None:
+        bias_norm = float(jnp.linalg.norm(bias))
+        residual = all_params - bias[None, :]
+    else:
+        bias_norm = 0.0
+        residual = all_params
+
+    residual_norm = float(jnp.mean(jnp.linalg.norm(residual, axis=1)))
+    return {
+        "probe_param_norm": total_norm,
+        "probe_param_std": total_std,
+        "probe_bias_norm": bias_norm,
+        "probe_residual_norm": residual_norm,
+    }
 
 
 def _plot(metrics: list[dict[str, Any]], out_path: Path) -> None:
@@ -279,6 +345,10 @@ def _run_loop(
 ) -> tuple[ModularHNN, list[dict[str, Any]]]:
     key = jax.random.PRNGKey(cfg.seed + start_epoch)
 
+    shrink_bias = cfg.shrink_target in ("bias", "both")
+    shrink_weight = cfg.shrink_target in ("weight", "both")
+    shrink_factor = 1.0 - cfg.shrink_wd * cfg.lr
+
     @eqx.filter_jit
     def step(
         model: ModularHNN,
@@ -295,7 +365,34 @@ def _run_loop(
             )[0]
         )(model)
         updates, new_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
-        return eqx.apply_updates(model, updates), new_state, loss
+        model = eqx.apply_updates(model, updates)
+
+        # Post-step multiplicative shrinkage — bypasses Adam, true AdamW-style
+        # WD applied directly to the chosen carrier(s) of the target params.
+        if shrink_bias and shrink_weight:
+            last = model.stimulus_ffn.layers[-1]
+            assert last.bias is not None
+            model = eqx.tree_at(
+                lambda m: (m.stimulus_ffn.layers[-1].weight, m.stimulus_ffn.layers[-1].bias),
+                model,
+                (last.weight * shrink_factor, last.bias * shrink_factor),
+            )
+        elif shrink_weight:
+            model = eqx.tree_at(
+                lambda m: m.stimulus_ffn.layers[-1].weight,
+                model,
+                model.stimulus_ffn.layers[-1].weight * shrink_factor,
+            )
+        elif shrink_bias:
+            last_bias = model.stimulus_ffn.layers[-1].bias
+            assert last_bias is not None
+            model = eqx.tree_at(
+                lambda m: m.stimulus_ffn.layers[-1].bias,
+                model,
+                last_bias * shrink_factor,
+            )
+
+        return model, new_state, loss
 
     @eqx.filter_jit
     def eval_metrics(
@@ -312,6 +409,13 @@ def _run_loop(
         _fixed_x_samples = jax.random.uniform(
             subkey, (cfg.n_mc, cfg.n_stimulus), minval=-1.0, maxval=1.0
         )
+
+    # Independent of cfg.seed/fixed_x so it's identical across arms — makes
+    # param_std/param_norm/bias_norm directly comparable across the ablation.
+    probe_x = jax.random.uniform(
+        jax.random.PRNGKey(cfg.probe_seed), (cfg.probe_n, cfg.n_stimulus),
+        minval=-1.0, maxval=1.0,
+    )
 
     metrics = list(existing_metrics)
     pbar = trange(n_epochs, desc="epochs")
@@ -377,6 +481,7 @@ def _run_loop(
                 "test_acc_max": float(jnp.max(per_x_te_acc)),
                 "param_std": p_std,
                 "param_norm": p_norm,
+                **_probe_metrics(model, probe_x),
             }
             metrics.append(record)
             pbar.set_postfix(
@@ -406,6 +511,7 @@ def _setup(cfg: GrokkingHNNConfig) -> tuple[Any, ModularHNN]:
         stim_ffn_hidden=cfg.stim_ffn_hidden,
         stim_ffn_depth=cfg.stim_ffn_depth,
         init_scale=cfg.init_scale,
+        output_bias=cfg.output_bias,
     )
     return dataset, model
 
@@ -428,6 +534,7 @@ def train(cfg: GrokkingHNNConfig) -> ModularHNN:
         f"{dataset.test_inputs.shape[0]} test  ({cfg.train_fraction:.0%} split)"
     )
     print(f"n_mc={cfg.n_mc}, lambda_complexity={cfg.lambda_complexity}, weight_decay={cfg.weight_decay}, grad_clip={cfg.grad_clip}")
+    print(f"output_bias={cfg.output_bias}, shrink_target={cfg.shrink_target}, shrink_wd={cfg.shrink_wd}, fixed_x={cfg.fixed_x}")
 
     optimizer = optax.chain(
         optax.clip_by_global_norm(cfg.grad_clip),

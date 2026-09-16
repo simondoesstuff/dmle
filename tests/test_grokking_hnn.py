@@ -1,5 +1,7 @@
 """Tests for ModularHNN and HNN grokking training."""
 
+import json
+
 import jax
 import jax.numpy as jnp
 import equinox as eqx
@@ -182,3 +184,121 @@ def test_train_smoke(tmp_path):
     assert (tmp_path / "grokking_hnn" / "metrics.json").exists()
     assert (tmp_path / "grokking_hnn" / "grokking_hnn_curve.png").exists()
     assert (tmp_path / "grokking_hnn" / "model.eqx").exists()
+
+
+# ── ablation knobs: output_bias / shrink_target / probe metrics ───────────────
+
+def _small_ablation_cfg(tmp_path, **overrides) -> GrokkingHNNConfig:
+    defaults = dict(
+        data_dir=str(tmp_path / "grokking_hnn"),
+        modulus=11,
+        target_hidden=8,
+        target_depth=1,
+        n_stimulus=4,
+        stim_ffn_hidden=4,
+        stim_ffn_depth=1,
+        train_fraction=0.5,
+        lambda_complexity=0.0,
+        n_epochs=20,
+        log_interval=10,
+        n_mc=2,
+        hexplot_interval=0,
+        seed=0,
+    )
+    defaults.update(overrides)
+    return GrokkingHNNConfig(**defaults)
+
+
+def test_output_bias_false_has_no_bias():
+    model = make_modular_hypernetwork(
+        KEY, in_dim=2 * P + 1, out_dim=P, target_hidden=8, target_depth=1,
+        n_stimulus=4, stim_ffn_hidden=4, stim_ffn_depth=1, output_bias=False,
+    )
+    assert model.stimulus_ffn.layers[-1].bias is None
+
+
+def test_output_bias_false_trains(tmp_path):
+    cfg = _small_ablation_cfg(tmp_path, output_bias=False)
+    model = train(cfg)
+    assert isinstance(model, ModularHNN)
+    assert model.stimulus_ffn.layers[-1].bias is None
+
+
+def test_shrink_target_requires_compatible_output_bias():
+    with pytest.raises(ValueError):
+        GrokkingHNNConfig(output_bias=False, shrink_target="bias", shrink_wd=1.0)
+    with pytest.raises(ValueError):
+        GrokkingHNNConfig(shrink_target="bias", shrink_wd=0.0)  # wd=0 is a no-op
+    with pytest.raises(ValueError):
+        GrokkingHNNConfig(shrink_target="not-a-target")
+
+
+def test_shrink_bias_reduces_bias_norm(tmp_path):
+    """Bias shrinkage should pull ‖b_last‖ below the no-shrinkage baseline."""
+    base = _small_ablation_cfg(tmp_path / "off", shrink_target="none", n_epochs=50, log_interval=25)
+    shrunk = _small_ablation_cfg(tmp_path / "on", shrink_target="bias", shrink_wd=50.0, n_epochs=50, log_interval=25)
+
+    model_off = train(base)
+    model_on = train(shrunk)
+
+    bias_off = model_off.stimulus_ffn.layers[-1].bias
+    bias_on = model_on.stimulus_ffn.layers[-1].bias
+    assert bias_off is not None and bias_on is not None
+    assert float(jnp.linalg.norm(bias_on)) < float(jnp.linalg.norm(bias_off))
+
+
+def test_shrink_weight_reduces_weight_norm(tmp_path):
+    """Weight shrinkage (the output_bias=False carrier) should pull ‖W_last‖ below baseline."""
+    base = _small_ablation_cfg(
+        tmp_path / "off", output_bias=False, shrink_target="none", n_epochs=50, log_interval=25,
+    )
+    shrunk = _small_ablation_cfg(
+        tmp_path / "on", output_bias=False, shrink_target="weight", shrink_wd=50.0,
+        n_epochs=50, log_interval=25,
+    )
+
+    model_off = train(base)
+    model_on = train(shrunk)
+
+    assert float(jnp.linalg.norm(model_on.stimulus_ffn.layers[-1].weight)) < float(
+        jnp.linalg.norm(model_off.stimulus_ffn.layers[-1].weight)
+    )
+
+
+def test_probe_metrics_logged(tmp_path):
+    cfg = _small_ablation_cfg(tmp_path, probe_n=8)
+    train(cfg)
+    metrics = json.loads((tmp_path / "grokking_hnn" / "metrics.json").read_text())
+    assert "probe_param_norm" in metrics[-1]
+    assert "probe_bias_norm" in metrics[-1]
+    assert "probe_residual_norm" in metrics[-1]
+    assert "probe_param_std" in metrics[-1]
+
+
+def test_probe_metrics_identical_across_fixed_x(tmp_path):
+    """probe_* metrics use a probe set independent of fixed_x/seed, so param_std
+    there should be nonzero even when fixed_x=True (unlike the fixed_x-biased
+    `param_std` field, which collapses to 0 by construction)."""
+    cfg = _small_ablation_cfg(tmp_path, fixed_x=True, n_mc=1, probe_n=8)
+    train(cfg)
+    metrics = json.loads((tmp_path / "grokking_hnn" / "metrics.json").read_text())
+    assert metrics[-1]["param_std"] == 0.0
+    assert metrics[-1]["probe_param_std"] > 0.0
+
+
+def test_checkpoint_round_trip_with_output_bias_false(tmp_path):
+    cfg = _small_ablation_cfg(
+        tmp_path, output_bias=False, n_epochs=20, checkpoint_interval=10,
+    )
+    train(cfg)
+    data_dir = tmp_path / "grokking_hnn"
+    ckpts = sorted(data_dir.glob("checkpoint_*.eqx"))
+    # epoch 1 (first-iter checkpoint), epoch 10, epoch 20
+    assert len(ckpts) == 3
+
+    saved_cfg = json.loads((data_dir / "config.json").read_text())
+    assert saved_cfg["output_bias"] is False
+
+    _, template = _setup(cfg)
+    restored = eqx.tree_deserialise_leaves(str(ckpts[-1]), template)
+    assert restored.stimulus_ffn.layers[-1].bias is None

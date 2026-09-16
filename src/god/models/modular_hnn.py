@@ -76,6 +76,7 @@ def make_modular_hypernetwork(
     stim_ffn_hidden: int = 8,
     stim_ffn_depth: int = 1,
     init_scale: float = 0.1,
+    output_bias: bool = True,
 ) -> ModularHNN:
     """Build a ModularHNN.
 
@@ -86,6 +87,9 @@ def make_modular_hypernetwork(
         stim_ffn_hidden: hidden width of the stimulus MLP.
         init_scale: scale factor for the stimulus FFN output layer (keeps
             generated target weights small at init to avoid gradient blowup).
+        output_bias: if False, the stimulus FFN's final layer has no bias —
+            every generated target param must flow through the x-dependent
+            pathway (no x-independent "free" copy for Adam to hide in).
     """
     dims = [in_dim] + [target_hidden] * target_depth + [out_dim]
     param_layout: list[tuple[str, tuple[int, ...]]] = []
@@ -102,17 +106,26 @@ def make_modular_hypernetwork(
         width_size=stim_ffn_hidden,
         depth=stim_ffn_depth,
         activation=jax.nn.tanh,
+        use_final_bias=output_bias,
         key=key,
     )
-    assert stimulus_ffn.layers[-1].bias is not None
-    stimulus_ffn = eqx.tree_at(
-        lambda m: (m.layers[-1].weight, m.layers[-1].bias),
-        stimulus_ffn,
-        (
+    if output_bias:
+        assert stimulus_ffn.layers[-1].bias is not None
+        stimulus_ffn = eqx.tree_at(
+            lambda m: (m.layers[-1].weight, m.layers[-1].bias),
+            stimulus_ffn,
+            (
+                stimulus_ffn.layers[-1].weight * init_scale,
+                stimulus_ffn.layers[-1].bias * init_scale,
+            ),
+        )
+    else:
+        assert stimulus_ffn.layers[-1].bias is None
+        stimulus_ffn = eqx.tree_at(
+            lambda m: m.layers[-1].weight,
+            stimulus_ffn,
             stimulus_ffn.layers[-1].weight * init_scale,
-            stimulus_ffn.layers[-1].bias * init_scale,
-        ),
-    )
+        )
 
     return ModularHNN(
         stimulus_ffn=stimulus_ffn,
